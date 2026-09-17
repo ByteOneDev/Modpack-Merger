@@ -1,0 +1,58 @@
+name: Deployer sur GitHub Pages
+
+# Attention : GitHub Pages ne sert que des fichiers statiques. Le dossier
+# functions/ n'y est pas execute, donc CurseForge restera inactif sauf si un
+# relais externe est renseigne dans les parametres de l'application.
+# Pour un deploiement ou CurseForge fonctionne sans configuration, voir la
+# section "Cloudflare Pages" du README.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Un "project site" est servi sous /<nom-du-depot>/ : sans basePath,
+      # tous les liens et fichiers statiques pointeraient a la racine.
+      - name: Construire le site statique
+        env:
+          NEXT_PUBLIC_BASE_PATH: ${{ github.event.repository.name != format('{0}.github.io', github.repository_owner) && format('/{0}', github.event.repository.name) || '' }}
+        run: npm run build
+
+      # .nojekyll et les fichiers de deploy/ sont poses par scripts/postbuild.mjs,
+      # que `npm run build` enchaine automatiquement.
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

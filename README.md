@@ -1,0 +1,299 @@
+# Modpack Merger
+
+Web app qui fusionne **plusieurs** modpacks Minecraft en un seul, aligne tous
+les mods sur un mod loader et une version communs, remplace ceux qui
+n'existent pas de l'autre côté, et estime la RAM à allouer au résultat.
+
+Tout tourne dans le navigateur : **aucun serveur, aucun envoi de fichier**. Tes
+modpacks ne quittent jamais ta machine.
+
+## Démarrer en local
+
+```bash
+npm install && npm run dev
+```
+
+Puis <http://localhost:3000>.
+
+## Où l'héberger
+
+L'app est un export statique. Selon l'endroit où tu la déposes, elle dispose
+ou non d'une petite couche serveur — et c'est **la seule chose** qui change
+entre les hébergements.
+
+| Hébergement | Gratuit | CurseForge | Téléchargement des jars |
+|---|---|---|---|
+| **Cloudflare Pages** | oui | automatique | via le relais, tous les CDN |
+| **Netlify**, **Vercel** | oui | automatique | via le relais |
+| **GitHub Pages** | oui | relais externe à déployer | direct, certains CDN bloquent |
+
+Le dossier `functions/` du dépôt contient le relais. Cloudflare Pages, Netlify
+et Vercel l'exécutent en plus des fichiers statiques ; GitHub Pages l'ignore.
+L'app détecte la situation toute seule au démarrage et l'affiche dans
+**Paramètres → Sources de mods**.
+
+### Cloudflare Pages (recommandé)
+
+Rien à installer, tout se fait depuis l'interface web :
+
+1. **Workers & Pages → Create → Pages → Connect to Git**, choisis le dépôt.
+2. Build command : `npm run build` — Output directory : `out`.
+3. **Settings → Environment variables** : ajoute `CURSEFORGE_API_KEY`
+   (chiffrée, jamais envoyée au navigateur).
+4. Déploie.
+
+CurseForge fonctionne immédiatement, sans rien configurer dans l'application.
+
+### GitHub Pages
+
+Le workflow `.github/workflows/deploy.yml` construit et publie à chaque push
+sur `main`.
+
+1. Pousse le dépôt sur GitHub.
+2. **Settings → Pages**, source : **GitHub Actions**.
+
+Le `basePath` est calculé automatiquement d'après le nom du dépôt. CurseForge
+restera inactif : pour l'activer, déploie le Worker de `proxy/` (voir plus
+bas) et colle son URL dans les paramètres.
+
+### Construire à la main
+
+```bash
+NEXT_PUBLIC_BASE_PATH=/mon-depot npm run build   # sort dans out/
+```
+
+`NEXT_DIST_DIR=.next-autre` permet de construire sans perturber un
+`npm run dev` en cours, qui utiliserait sinon le même cache.
+
+## CurseForge : pourquoi un relais
+
+Modrinth ne demande rien : son API est publique et interrogeable depuis un
+navigateur.
+
+CurseForge, non. Son API exige une clé secrète et refuse les appels venant
+d'une page web. Et **un site statique ne peut pas garder de secret** : une clé
+placée dans le code serait lisible par tous les visiteurs. Il faut donc que
+quelque chose la détienne côté serveur.
+
+C'est exactement ce que fait `functions/api/curseforge/[[path]].js`. Si ton
+hébergement exécute les fonctions, c'est réglé. Sinon, `proxy/curseforge-worker.js`
+est le même relais sous forme de Worker autonome :
+
+```bash
+npm install -g wrangler
+wrangler login
+wrangler deploy proxy/curseforge-worker.js --name curseforge-relay --compatibility-date 2026-01-01
+wrangler secret put CURSEFORGE_API_KEY --name curseforge-relay
+```
+
+Colle l'URL obtenue dans **Paramètres → Sources de mods**, puis *Tester la
+connexion*.
+
+Dans les deux cas le relais ne transmet qu'une liste fermée de routes, filtre
+les paramètres de requête et plafonne la taille des corps : ce n'est pas un
+proxy ouvert.
+
+La clé s'obtient sur [console.curseforge.com](https://console.curseforge.com/)
+(onglet API Keys) ; la validation est manuelle et prend 1 à 3 jours.
+
+**Sans relais, l'app fonctionne**, mais les mods publiés uniquement sur
+CurseForge ne sont même pas identifiés : ils apparaissent sous la forme
+`Projet CurseForge 272515` et sont comptés comme introuvables.
+
+## Ce que fait l'outil
+
+### Lecture des packs
+
+Trois formats, détectés automatiquement, sans limite de nombre :
+
+| Format | Reconnu par | Mods identifiés par |
+|---|---|---|
+| Modrinth `.mrpack` | `modrinth.index.json` | URL du CDN Modrinth |
+| CurseForge `.zip` | `manifest.json` | numéros projet/fichier (via le relais) |
+| Archive brute | présence de `mods/*.jar` | sha1 (Modrinth) et empreinte murmur2 (CurseForge) |
+
+Pour une archive brute, chaque `.jar` est aussi ouvert pour lire ses
+métadonnées internes (`fabric.mod.json`, `quilt.mod.json`,
+`META-INF/mods.toml`, `META-INF/neoforge.mods.toml`), ce qui permet
+d'identifier même un mod jamais publié.
+
+### Fusion
+
+1. **Ordre de priorité** — tu ranges les packs à l'étape 1. En cas de valeur
+   contradictoire, le pack le plus haut l'emporte.
+2. **Déduplication** — un mod présent dans plusieurs packs devient une seule
+   entrée. La correspondance se fait sur l'identifiant de projet, le hash du
+   fichier, le `modId` du jar ou le titre normalisé.
+3. **Résolution** — chaque mod est cherché dans la combinaison loader +
+   version demandée, dans sa version **la plus récente parmi les plus
+   stables** : une release récente l'emporte sur une beta plus récente. Une
+   beta n'est retenue qu'à défaut, et elle est signalée.
+4. **Dépendances** — les dépendances requises manquantes sont ajoutées
+   récursivement, dans la bonne version.
+5. **Doublons fonctionnels** — des mods différents qui font la même chose sont
+   détectés : `bloquant` (deux moteurs de rendu = crash au démarrage) ou
+   `redondant` (deux minimaps). Un clic écarte les autres.
+6. **Fichiers de configuration** — seuls les fichiers fournis par plusieurs
+   packs avec un contenu différent demandent un arbitrage. Par fichier : garder
+   la version d'un pack précis, fusionner, tout garder (les non prioritaires
+   renommés), ou ignorer.
+
+### Mods introuvables
+
+Un bouton **« Chercher une alternative pour les N mods »** traite tout le lot
+d'un coup : progression, estimation du temps restant, arrêt possible à tout
+moment sans perdre ce qui a déjà été trouvé. À la fin, un écran de revue
+montre chaque remplacement proposé, et **seules les propositions qui sont un
+projet original en version stable sont cochées d'office** — les forks et les
+betas sont proposés mais laissés décochés. Chaque ligne permet de choisir une
+autre proposition. Un repli mod par mod reste disponible.
+
+Dans les deux cas, la recherche fonctionne ainsi :
+
+- une **table d'équivalences curée** (`src/lib/core/merge/knowledge.ts`), qui
+  encode ce qu'une recherche textuelle ne peut pas trouver : Sodium ne contient
+  pas « OptiFine » dans son nom, Jade ne contient pas « Waila » ;
+- une recherche sur les deux plateformes, notée sur la popularité, la
+  fraîcheur de maintenance et la proximité du nom.
+
+Deux garanties :
+
+- **chaque proposition a réellement une version installable** sur la cible —
+  les candidats sans version compatible sont écartés avant affichage ;
+- **les forks sont pénalisés et étiquetés**. Un fork n'arrive en tête que si
+  aucun projet original ne couvre la fonction, et l'interface le dit alors
+  explicitement.
+
+### Estimation de RAM
+
+Calculée à partir de signaux réels du pack, pas d'une règle unique :
+
+- coût de base du jeu selon la version de Minecraft ;
+- coût par mod dégressif (les bibliothèques sont mutualisées) ;
+- mods connus pour leur appétit (GregTech, Distant Horizons, refontes de
+  biomes…) ou pour leurs économies (FerriteCore, ModernFix, Sodium) — l'effet
+  des optimisations grandit avec la taille du pack, il n'est donc pas appliqué
+  à taux plein sur un petit pack ;
+- shaders et packs de ressources, côté client uniquement.
+
+L'app donne une valeur client, une valeur serveur, un minimum, les arguments
+JVM prêts à copier, et **le détail complet du calcul** pour que tu puisses
+juger. Les ordres de grandeur obtenus : 50 mods → 4 Go, 150 mods → 6 Go,
+150 mods + shaders → 8 Go, 250 mods → 7,5 Go.
+
+### Ajout manuel
+
+Un champ de recherche permet d'ajouter n'importe quel mod des deux
+plateformes, dans sa version la plus récente compatible, avec ses dépendances.
+
+### Export
+
+| Format | Pour |
+|---|---|
+| `.mrpack` | Modrinth App, Prism, ATLauncher, MultiMC |
+| `.zip` CurseForge | CurseForge App, hébergeurs de serveurs |
+
+Et deux modes :
+
+- **Pack complet** — les `.jar` sont téléchargés et inclus dans
+  `overrides/mods/`. S'installe partout, archive lourde.
+- **Manifeste seul** — quelques Ko, le lanceur télécharge les mods. Le format
+  natif est respecté quand c'est possible : un `.mrpack` ne peut référencer que
+  des liens Modrinth, GitHub ou GitLab, donc les mods CurseForge sont de toute
+  façon embarqués.
+
+L'archive contient toujours un `RAPPORT-DE-FUSION.md` : ce qui a été gardé,
+remplacé, écarté, abandonné, et la RAM recommandée avec son calcul.
+
+## Architecture
+
+```
+src/
+  app/
+    page.tsx              étape 1 — choix et ordre des packs
+    cible/                étape 2 — loader, version, lancement de la fusion
+    mods/                 étape 3 — résultat, RAM, alternatives, conflits, ajout
+    fichiers/             étape 4 — arbitrage des configs
+    export/               étape 5 — génération de l'archive
+    reglages/             paramètres
+  components/
+    ui/                   primitives shadcn/ui (Radix + Tailwind)
+  lib/
+    core/                 moteur isomorphe, sans aucune dépendance Node
+      providers/          clients Modrinth et CurseForge (cache, retry, quotas)
+      merge/
+        knowledge.ts      équivalences, conflits, profils mémoire — le cœur éditorial
+        resolve.ts        déduplication et choix de version
+        alternatives.ts   recherche et notation des remplaçants
+        overrides.ts      fusion N-way des fichiers de config
+        ram.ts            estimation de mémoire
+      parse.ts            lecture des trois formats de pack
+      build.ts            génération de l'archive
+    store.tsx             état de l'assistant (React context + IndexedDB)
+    settings.ts           préférences (localStorage)
+```
+
+`lib/core` ne contient ni `node:*` ni `process.env` : c'est ce qui permet à
+tout le moteur de tourner dans le navigateur.
+
+Les archives sont conservées dans IndexedDB pour qu'un rechargement de page ne
+fasse pas perdre le travail en cours. **Paramètres → Données locales** montre
+la place occupée et permet de tout effacer.
+
+## Étendre la base de connaissances
+
+`src/lib/core/merge/knowledge.ts` est fait pour être complété à la main :
+
+- `EQUIVALENCES` — familles de mods interchangeables, avec le remplaçant
+  recommandé par loader (`prefer`) et les compagnons à ajouter (`also`, par
+  exemple Iris en plus de Sodium pour remplacer OptiFine) ;
+- `CONFLICT_GROUPS` — familles de mods qui ne doivent pas cohabiter, avec la
+  sévérité et l'ordre de préférence ;
+- `MEMORY_PROFILE` — surcoûts et économies mémoire par mod ;
+- `LOADER_ONLY` — mods dont l'absence sur un loader donné est normale.
+
+Ajouter une entrée suffit, les index sont construits automatiquement.
+
+## Sécurité
+
+L'app est publique et avale des archives fournies par n'importe qui. Ce qui a
+été traité :
+
+| Vecteur | Traitement |
+|---|---|
+| **Bombe de décompression** | Le catalogue du zip est inspecté **avant** toute décompression : nombre d'entrées, taille décompressée et taux de compression. Une archive de 199 Ko qui donne 200 Mo est refusée avec un message clair. |
+| **Zip slip** | Les chemins d'archive contenant `..`, un chemin absolu, une lettre de lecteur ou un octet nul sont ignorés, à la lecture comme à l'écriture. |
+| **Pollution de prototype** | Les tables indexées par chemin d'archive utilisent un prototype nul, et la fusion JSON ignore `__proto__`, `constructor` et `prototype`. Elle teste la propriété propre plutôt que l'opérateur `in`, sans quoi une clé de config nommée `toString` était fusionnée contre la méthode héritée. |
+| **SSRF** | Le relais de téléchargement n'accepte qu'une liste blanche de CDN, impose HTTPS, et **revalide la destination après chaque redirection** plutôt que de les suivre aveuglément. |
+| **Proxy ouvert** | Le relais CurseForge ne transmet qu'une liste fermée de routes, ne recopie que les paramètres de requête attendus, plafonne les corps POST à 256 Ko et restreint l'origine appelante. |
+| **Fuite de clé** | La clé CurseForge vit dans une variable d'environnement côté serveur et n'atteint jamais le navigateur. Le champ « clé API » côté client n'apparaît que si un relais externe est configuré, et prévient qu'il est déconseillé. |
+| **XSS** | Aucun `innerHTML` ni `eval`. Le seul script inline est une chaîne littérale qui applique le thème avant le premier rendu. Tout le contenu venant des API est rendu comme texte par React. |
+| **Clickjacking, sniffing** | `deploy/_headers` pose `X-Frame-Options`, `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy` et une `Permissions-Policy` restrictive. Lu par Cloudflare Pages et Netlify ; GitHub Pages ne permet pas de définir d'en-têtes. |
+
+**Injection SQL : sans objet.** Il n'y a ni base de données ni backend
+applicatif — l'app ne fait que lire des archives et interroger deux API
+publiques en lecture seule.
+
+`npm audit` signale deux avis sur **PostCSS**, tiré transitivement par Next.
+Ils concernent le traitement de CSS fourni par un attaquant, au moment de la
+construction ; ici le CSS est celui du projet, et aucun correctif n'est
+disponible en amont. Aucun impact à l'exécution.
+
+Ce qui reste à ta charge si tu rends le site public : le relais consomme ton
+quota CurseForge. Renseigne `ALLOWED_ORIGIN` (fonction) ou `ALLOWED_ORIGINS`
+(Worker) avec ton domaine, sinon n'importe qui peut l'utiliser.
+
+## Limites connues
+
+- **Sans relais CurseForge**, la moitié du catalogue est hors de portée.
+- Le téléchargement des jars se fait depuis le navigateur : certains CDN
+  refusent les requêtes venant d'une page web. Les mods concernés sont listés
+  à la fin de l'export, à récupérer à la main. Le mode *manifeste seul* évite
+  le problème.
+- Un mod dont l'auteur a désactivé la distribution tierce sur CurseForge ne
+  peut pas être embarqué. C'est une limite de la plateforme.
+- La fusion ligne à ligne des configs traite le JSON et les formats clé=valeur
+  (`toml`, `cfg`, `properties`, `ini`). Les autres formats demandent de choisir
+  une version.
+- Deux refontes de génération du monde sont signalées comme redondantes mais
+  pas réconciliées : cela demande un datapack dédié.
