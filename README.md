@@ -17,44 +17,54 @@ Puis <http://localhost:3000>.
 
 ## Où l'héberger
 
-L'app est un export statique. Selon l'endroit où tu la déposes, elle dispose
-ou non d'une petite couche serveur — et c'est **la seule chose** qui change
-entre les hébergements.
+Le site est un export statique. Selon l'endroit où tu le déposes, il dispose
+ou non d'une petite couche serveur — et c'est **la seule chose** qui change.
 
 | Hébergement | Gratuit | CurseForge | Téléchargement des jars |
 |---|---|---|---|
-| **Cloudflare Pages** | oui | automatique | via le relais, tous les CDN |
-| **Netlify**, **Vercel** | oui | automatique | via le relais |
+| **Cloudflare Workers** | oui | automatique | via le relais, tous les CDN |
 | **GitHub Pages** | oui | relais externe à déployer | direct, certains CDN bloquent |
 
-Le dossier `functions/` du dépôt contient le relais. Cloudflare Pages, Netlify
-et Vercel l'exécutent en plus des fichiers statiques ; GitHub Pages l'ignore.
-L'app détecte la situation toute seule au démarrage et l'affiche dans
-**Paramètres → Sources de mods**.
+### Cloudflare Workers (recommandé)
 
-### Cloudflare Pages (recommandé)
+`wrangler.toml` déclare le dossier `out/` comme fichiers statiques et
+`worker/index.js` comme code serveur. Cloudflare sert les fichiers en
+priorité ; le Worker ne reçoit que les routes `/api/`, c'est-à-dire les deux
+relais.
 
-Rien à installer, tout se fait depuis l'interface web :
+Depuis le tableau de bord, *Workers & Pages → Create → Import a repository* :
 
-1. **Workers & Pages → Create → Pages → Connect to Git**, choisis le dépôt.
-2. Build command : `npm run build` — Output directory : `out`.
-3. **Settings → Environment variables** : ajoute `CURSEFORGE_API_KEY`
-   (chiffrée, jamais envoyée au navigateur).
-4. Déploie.
+| Réglage | Valeur |
+|---|---|
+| Build command | `npm run build` |
+| Deploy command | `npx wrangler deploy` |
 
-CurseForge fonctionne immédiatement, sans rien configurer dans l'application.
+Puis dans *Settings → Variables and Secrets* :
+
+- `CURSEFORGE_API_KEY` — ta clé, en type **Secret** (chiffrée, jamais envoyée
+  au navigateur). Le site se déploie très bien sans, CurseForge sera
+  simplement inactif.
+- `NODE_VERSION` = `22` — sinon Cloudflare utilise un Node trop ancien pour
+  Next 15 et le build échoue.
+- `ALLOWED_ORIGIN` = l'URL de ton site, si tu ne veux pas que d'autres
+  consomment ton quota CurseForge.
+
+En ligne de commande, une fois `wrangler login` fait :
+
+```bash
+npm run deploy
+```
+
+et `npm run preview` lance le tout en local, Worker compris.
 
 ### GitHub Pages
 
 Le workflow `.github/workflows/deploy.yml` construit et publie à chaque push
-sur `main`.
+sur `main`. Dans **Settings → Pages**, choisis la source **GitHub Actions**.
 
-1. Pousse le dépôt sur GitHub.
-2. **Settings → Pages**, source : **GitHub Actions**.
-
-Le `basePath` est calculé automatiquement d'après le nom du dépôt. CurseForge
-restera inactif : pour l'activer, déploie le Worker de `proxy/` (voir plus
-bas) et colle son URL dans les paramètres.
+Le `basePath` est calculé d'après le nom du dépôt. GitHub Pages n'exécute
+aucun code : CurseForge restera inactif tant que tu n'auras pas déployé le
+Worker autonome de `proxy/` et collé son URL dans les paramètres.
 
 ### Construire à la main
 
@@ -75,9 +85,9 @@ d'une page web. Et **un site statique ne peut pas garder de secret** : une clé
 placée dans le code serait lisible par tous les visiteurs. Il faut donc que
 quelque chose la détienne côté serveur.
 
-C'est exactement ce que fait `functions/api/curseforge/[[path]].js`. Si ton
-hébergement exécute les fonctions, c'est réglé. Sinon, `proxy/curseforge-worker.js`
-est le même relais sous forme de Worker autonome :
+C'est exactement ce que fait `worker/curseforge.js`, déployé avec le site sur
+Cloudflare. Si tu héberges ailleurs qu'un service exécutant du code,
+`proxy/curseforge-worker.js` est le même relais sous forme de Worker autonome :
 
 ```bash
 npm install -g wrangler
@@ -231,6 +241,9 @@ src/
       build.ts            génération de l'archive
     store.tsx             état de l'assistant (React context + IndexedDB)
     settings.ts           préférences (localStorage)
+worker/                 code serveur (relais CurseForge et téléchargements)
+deploy/                 fichiers copiés dans out/ après le build (_headers)
+proxy/                  relais autonome, pour un hébergement sans code serveur
 ```
 
 `lib/core` ne contient ni `node:*` ni `process.env` : c'est ce qui permet à
@@ -268,7 +281,7 @@ L'app est publique et avale des archives fournies par n'importe qui. Ce qui a
 | **Proxy ouvert** | Le relais CurseForge ne transmet qu'une liste fermée de routes, ne recopie que les paramètres de requête attendus, plafonne les corps POST à 256 Ko et restreint l'origine appelante. |
 | **Fuite de clé** | La clé CurseForge vit dans une variable d'environnement côté serveur et n'atteint jamais le navigateur. Le champ « clé API » côté client n'apparaît que si un relais externe est configuré, et prévient qu'il est déconseillé. |
 | **XSS** | Aucun `innerHTML` ni `eval`. Le seul script inline est une chaîne littérale qui applique le thème avant le premier rendu. Tout le contenu venant des API est rendu comme texte par React. |
-| **Clickjacking, sniffing** | `deploy/_headers` pose `X-Frame-Options`, `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy` et une `Permissions-Policy` restrictive. Lu par Cloudflare Pages et Netlify ; GitHub Pages ne permet pas de définir d'en-têtes. |
+| **Clickjacking, sniffing** | `deploy/_headers` pose `X-Frame-Options`, `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy` et une `Permissions-Policy` restrictive. GitHub Pages ne permet pas de définir d'en-têtes. |
 
 **Injection SQL : sans objet.** Il n'y a ni base de données ni backend
 applicatif — l'app ne fait que lire des archives et interroger deux API
@@ -280,8 +293,8 @@ construction ; ici le CSS est celui du projet, et aucun correctif n'est
 disponible en amont. Aucun impact à l'exécution.
 
 Ce qui reste à ta charge si tu rends le site public : le relais consomme ton
-quota CurseForge. Renseigne `ALLOWED_ORIGIN` (fonction) ou `ALLOWED_ORIGINS`
-(Worker) avec ton domaine, sinon n'importe qui peut l'utiliser.
+quota CurseForge. Renseigne `ALLOWED_ORIGIN` (Worker du site) ou `ALLOWED_ORIGINS`
+(Worker autonome) avec ton domaine, sinon n'importe qui peut l'utiliser.
 
 ## Limites connues
 

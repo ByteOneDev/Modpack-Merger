@@ -137,9 +137,7 @@ export default function SettingsPage() {
                 <TriangleAlert />
                 <AlertTitle>Relais present mais sans cle</AlertTitle>
                 <AlertDescription>
-                  {relay.message} Ajoute la variable{" "}
-                  <code className="font-mono text-xs">CURSEFORGE_API_KEY</code> dans les reglages
-                  de ton projet d&apos;hebergement, puis recharge la page.
+                  {relay.message} Recharge la page une fois la variable ajoutee.
                 </AlertDescription>
               </Alert>
             )}

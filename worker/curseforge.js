@@ -1,21 +1,17 @@
 /**
- * Relais CurseForge integre — Cloudflare Pages Function.
+ * Relais CurseForge.
  *
- * Pourquoi ce fichier plutot qu'un Worker separe : Cloudflare Pages sert le
- * dossier `out/` en statique ET execute ce qui se trouve dans `functions/`.
- * Le meme depot donne donc un site statique et une petite API, sans second
- * deploiement. Sur GitHub Pages, ce fichier est simplement ignore et l'app
- * bascule sur Modrinth seul (ou sur un relais externe si l'utilisateur en
- * renseigne un).
+ * L'API CurseForge exige une cle secrete et refuse les appels venant d'une
+ * page web. Comme le site est statique, il ne peut pas detenir de secret :
+ * une cle placee dans le code serait lisible par tous les visiteurs. Ce
+ * module tourne cote serveur, garde la cle, et relaie.
  *
- * La cle vit dans une variable d'environnement du projet Pages
- * (Settings -> Environment variables -> CURSEFORGE_API_KEY, chiffree).
- * Elle n'est jamais envoyee au navigateur.
+ * Ce n'est volontairement pas un proxy generique : seules les routes que
+ * l'application utilise reellement sont transmises.
  */
 
 const UPSTREAM = "https://api.curseforge.com";
 
-/** Le relais n'est pas un proxy ouvert : seules ces routes sont transmises. */
 const ALLOWED_PATHS = [
   /^v1\/mods\/search$/,
   /^v1\/mods$/,
@@ -25,19 +21,23 @@ const ALLOWED_PATHS = [
   /^v1\/fingerprints$/,
 ];
 
-/** Corps POST plafonne : une liste d'ids ne pese jamais plus que ca. */
+/** Corps POST plafonne : une liste d'identifiants ne pese jamais plus. */
 const MAX_BODY = 256 * 1024;
 
-export async function onRequest(context) {
-  const { request, env, params } = context;
-  // Les hebergeurs normalisent differemment les slashs de fin : on compare
-  // toujours un chemin nettoye, sinon "v1/mods/238222/" ne matcherait pas.
-  const path = (Array.isArray(params.path) ? params.path.join("/") : (params.path ?? ""))
-    .replace(/^\/+|\/+$/g, "");
+/** Parametres de requete recopies vers l'amont. Tout le reste est ignore. */
+const ALLOWED_PARAMS = [
+  "gameId", "classId", "searchFilter", "gameVersion", "modLoaderType",
+  "sortField", "sortOrder", "pageSize", "index", "categoryId", "slug",
+];
 
+export async function handleCurseforge(request, env, rawPath) {
+  // Les hebergeurs normalisent differemment les slashs : on compare toujours
+  // un chemin nettoye, sinon "v1/mods/238222/" ne correspondrait a rien.
+  const path = rawPath.replace(/^\/+|\/+$/g, "");
+
+  const origin = new URL(request.url).origin;
   const cors = {
-    // Meme origine que le site : pas besoin d'ouvrir a des tiers.
-    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || new URL(request.url).origin,
+    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || origin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Max-Age": "86400",
@@ -59,8 +59,8 @@ export async function onRequest(context) {
     return json(
       {
         error:
-          "Relais present mais non configure : ajoute la variable d'environnement " +
-          "CURSEFORGE_API_KEY dans les reglages du projet Pages.",
+          "Relais present mais non configure : ajoute la variable " +
+          "CURSEFORGE_API_KEY dans les reglages du projet Cloudflare.",
       },
       503,
       cors,
@@ -75,15 +75,9 @@ export async function onRequest(context) {
     }
   }
 
-  // Seuls les parametres attendus sont transmis : la chaine de requete du
-  // client ne doit pas pouvoir injecter n'importe quoi en amont.
   const incoming = new URL(request.url).searchParams;
-  const allowedParams = [
-    "gameId", "classId", "searchFilter", "gameVersion", "modLoaderType",
-    "sortField", "sortOrder", "pageSize", "index", "categoryId", "slug",
-  ];
   const qs = new URLSearchParams();
-  for (const name of allowedParams) {
+  for (const name of ALLOWED_PARAMS) {
     const v = incoming.get(name);
     if (v !== null && v.length <= 200) qs.set(name, v);
   }

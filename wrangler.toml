@@ -1,0 +1,24 @@
+# Deploiement Cloudflare Workers.
+#
+# `npm run build` produit le site statique dans out/. Cloudflare sert ces
+# fichiers en priorite ; le Worker ne recoit que ce qui ne correspond a aucun
+# fichier, c'est-a-dire les routes /api/ (le relais CurseForge et le relais de
+# telechargement des jars).
+#
+# La cle CurseForge ne figure pas ici : elle se definit dans le tableau de
+# bord, en Secret (Settings -> Variables and Secrets -> CURSEFORGE_API_KEY),
+# ou en local avec `wrangler secret put CURSEFORGE_API_KEY`.
+
+name = "modpack-merger"
+main = "worker/index.js"
+compatibility_date = "2026-09-01"
+
+[assets]
+directory = "./out"
+binding = "ASSETS"
+# "none" : un chemin inconnu tombe sur le Worker, qui sert lui-meme la page
+# 404 du site. Cela garantit que les routes /api/ atteignent toujours le code.
+not_found_handling = "none"
+
+[observability]
+enabled = true

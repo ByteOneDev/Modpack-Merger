@@ -1,12 +1,11 @@
 /**
- * Relais de telechargement de jars — Cloudflare Pages Function.
+ * Relais de telechargement de jars.
  *
  * Le navigateur ne peut pas toujours recuperer un jar directement : les CDN
- * de mods n'envoient pas tous les en-tetes CORS. Quand l'app est hebergee sur
- * une plateforme qui execute des fonctions, l'export "pack complet" passe par
- * ici et fonctionne pour tous les mods.
+ * de mods n'envoient pas tous les en-tetes CORS. En passant par ici, l'export
+ * en "pack complet" fonctionne pour tous les mods.
  *
- * C'est un relais qui prend une URL en parametre : c'est exactement la forme
+ * C'est un relais qui prend une URL en parametre, soit exactement la forme
  * d'une SSRF si on ne se protege pas. Trois verrous : liste blanche d'hotes,
  * HTTPS obligatoire, et revalidation apres chaque redirection.
  */
@@ -34,15 +33,16 @@ function allowed(url) {
   }
 }
 
-export async function onRequestGet(context) {
-  const { request } = context;
+export async function handleDownload(request) {
   const origin = new URL(request.url).origin;
   const cors = { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
 
-  const target = new URL(request.url).searchParams.get("url");
-  if (!target) {
-    return json({ error: "Parametre url manquant." }, 400, cors);
+  if (request.method !== "GET") {
+    return json({ error: "Methode non autorisee." }, 405, cors);
   }
+
+  const target = new URL(request.url).searchParams.get("url");
+  if (!target) return json({ error: "Parametre url manquant." }, 400, cors);
   if (!allowed(target)) {
     return json(
       { error: "Hote non autorise. Seuls les CDN de mods connus sont relayes." },
@@ -54,7 +54,7 @@ export async function onRequestGet(context) {
   // Redirections suivies a la main : "redirect: follow" empecherait de
   // verifier que chaque saut reste dans la liste blanche.
   let current = target;
-  let res;
+  let res = null;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     res = await fetch(current, { redirect: "manual" }).catch(() => null);
     if (!res) return json({ error: "Telechargement impossible." }, 502, cors);
@@ -76,16 +76,14 @@ export async function onRequestGet(context) {
   }
 
   const len = Number(res.headers.get("content-length") ?? "0");
-  if (len > MAX_BYTES) {
-    return json({ error: "Fichier trop volumineux." }, 413, cors);
-  }
+  if (len > MAX_BYTES) return json({ error: "Fichier trop volumineux." }, 413, cors);
 
   return new Response(res.body, {
     status: 200,
     headers: {
       ...cors,
       "Content-Type": "application/java-archive",
-      // Le contenu est un binaire tiers : on interdit toute interpretation.
+      // Contenu binaire tiers : on interdit toute interpretation par le navigateur.
       "X-Content-Type-Options": "nosniff",
       "Content-Disposition": "attachment",
       "Cache-Control": "public, max-age=3600",
