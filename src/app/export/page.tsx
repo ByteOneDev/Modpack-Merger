@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
-  CircleCheck, Download, FileDown, Loader2, Package, TriangleAlert,
+  CircleCheck, Download, FileDown, ListTree, Loader2, Package, TriangleAlert,
 } from "lucide-react";
 import { PageHeader } from "@/components/page-header";
 import { StepGuard } from "@/components/empty-state";
@@ -12,21 +12,29 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
+import { PackSummaryView } from "@/components/pack-summary";
+import { ManualDownloads } from "@/components/manual-downloads";
 import { useMerge } from "@/lib/store";
 import { readPackFiles } from "@/lib/analyze";
 import { buildPack, type BuildReport, type ExportFormat } from "@/lib/core/build";
+import { buildSummary } from "@/lib/core/summary";
+import { countLabel } from "@/lib/core/content";
+import { loadManualFiles, pendingDownloads } from "@/lib/manual";
+import { askWhereToSave, canStreamToDisk, downloadBlob } from "@/lib/save";
 import { humanSize } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 export default function ExportPage() {
   const router = useRouter();
-  const { state, settings, hydrated } = useMerge();
+  const { state, setState, settings, hydrated } = useMerge();
 
   const [format, setFormat] = React.useState<ExportFormat>(settings.defaultExportFormat);
   const [bundleJars, setBundleJars] = React.useState(settings.defaultBundleJars);
   const [progress, setProgress] = React.useState<{ step: string; done: number; total: number } | null>(null);
   const [report, setReport] = React.useState<BuildReport | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [showSummary, setShowSummary] = React.useState(false);
+  const [savedTo, setSavedTo] = React.useState<string | null>(null);
 
   if (!hydrated) return null;
   if (!state.analyzed || !state.target) {
@@ -44,6 +52,12 @@ export default function ExportPage() {
   const kept = state.resolutions.filter(
     (r) => r.status === "ok" || r.status === "substituted",
   );
+  const summary = buildSummary(state.resolutions);
+  const pending = pendingDownloads(
+    state.resolutions,
+    state.manualFiles,
+    new Set(state.failedDownloads),
+  );
 
   async function run() {
     setError(null);
@@ -51,6 +65,13 @@ export default function ExportPage() {
     setProgress({ step: "Preparation", done: 0, total: 1 });
     try {
       const packFiles = await readPackFiles(state.packs);
+      const manualFiles = await loadManualFiles(Object.keys(state.manualFiles));
+
+      // Nom propose avant generation : le choix du fichier doit suivre le
+      // clic de l'utilisateur, sinon le navigateur refuse d'ouvrir la fenetre.
+      const suggested = suggestedFileName(target, format);
+      const destination = bundleJars && canStreamToDisk() ? await askWhereToSave(suggested) : null;
+
       const built = await buildPack({
         target,
         resolutions: state.resolutions,
@@ -60,20 +81,32 @@ export default function ExportPage() {
         bundleJars,
         concurrency: settings.downloadConcurrency,
         ram: state.ram ?? undefined,
+        manualFiles,
+        sink: destination?.sink,
         onProgress: (step, done, total) => setProgress({ step, done, total }),
       });
 
-      const blob = new Blob([built.data as BlobPart], { type: "application/zip" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = built.report.fileName;
-      a.click();
-      URL.revokeObjectURL(url);
+      // Sans destination disque, l'archive revient en Blob : le navigateur la
+      // garde hors du tas JavaScript, ce qui permet deja de depasser le Go.
+      if (built.blob) downloadBlob(built.blob, built.report.fileName);
+      setSavedTo(destination ? destination.name : null);
 
       setReport(built.report);
+      // Les echecs alimentent la liste des telechargements manuels : un CDN
+      // qui refuse la requete pose le meme probleme qu'un refus de l'auteur.
+      setState((prev) => ({
+        ...prev,
+        failedDownloads: built.report.modsFailed.map((f) => f.key),
+      }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "La generation a echoue.");
+      setSavedTo(null);
+      const message = err instanceof Error ? err.message : String(err);
+      setError(
+        /allocation failed|out of memory|Array buffer/i.test(message)
+          ? "Memoire insuffisante pour assembler l'archive. Passe en « manifeste seul », " +
+            "ou reduis le nombre de telechargements simultanes dans les reglages."
+          : message || "La generation a echoue.",
+      );
     } finally {
       setProgress(null);
     }
@@ -85,8 +118,40 @@ export default function ExportPage() {
     <>
       <PageHeader
         title="Exporter le pack fusionne"
-        description={`${kept.length} mods · ${target.loader} ${target.minecraft} · l'archive contient un RAPPORT-DE-FUSION.md detaillant ce qui a ete garde, remplace et abandonne, ainsi que la RAM recommandee.`}
+        description={`${summary.totalItems} elements · ${target.loader} ${target.minecraft} · l'archive contient un RAPPORT-DE-FUSION.md detaillant ce qui a ete garde, remplace et abandonne, ainsi que la RAM recommandee.`}
+        action={
+          <Button variant={showSummary ? "secondary" : "outline"} onClick={() => setShowSummary((v) => !v)}>
+            <ListTree />
+            {showSummary ? "Masquer le recapitulatif" : "Voir le recapitulatif"}
+          </Button>
+        }
       />
+
+      <div className="mb-6 flex flex-wrap gap-2">
+        {summary.groups.map((g) => (
+          <Badge key={g.kind} variant="secondary">
+            {countLabel(g.kind, g.items.length)}
+          </Badge>
+        ))}
+        <Badge variant="outline">{summary.clientOnly.length} client seul</Badge>
+        <Badge variant="outline">{summary.serverOnly.length} serveur seul</Badge>
+      </div>
+
+      {showSummary && (
+        <div className="mb-6">
+          <PackSummaryView summary={summary} />
+        </div>
+      )}
+
+      {(pending.length > 0 || Object.keys(state.manualFiles).length > 0) && (
+        <div className="mb-6">
+          <ManualDownloads
+            pending={pending}
+            have={state.manualFiles}
+            onChange={(next) => setState((prev) => ({ ...prev, manualFiles: next }))}
+          />
+        </div>
+      )}
 
       <Card className="mb-6">
         <CardHeader>
@@ -149,8 +214,10 @@ export default function ExportPage() {
           <AlertTitle>Le telechargement se fait depuis ton navigateur</AlertTitle>
           <AlertDescription>
             Certains CDN refusent les requetes venant d&apos;une page web. Les mods concernes
-            seront listes a la fin, a recuperer a la main. Le mode manifeste seul evite ce
-            probleme.
+            seront listes dans « Telechargements manuels », a recuperer depuis leur page.{" "}
+            {canStreamToDisk()
+              ? "L'archive sera ecrite au fil de l'eau dans le fichier que tu choisiras : aucune limite de taille."
+              : "Ton navigateur ne permet pas d'ecrire directement sur le disque ; l'archive est assemblee puis telechargee, ce qui peut echouer au-dela de 2 Go. Chrome, Edge et Opera n'ont pas cette limite."}
           </AlertDescription>
         </Alert>
       )}
@@ -197,8 +264,9 @@ export default function ExportPage() {
               Pack genere
             </CardTitle>
             <CardDescription>
-              Le telechargement a demarre. Si rien ne s&apos;est passe, verifie que ton navigateur
-              ne bloque pas les telechargements automatiques.
+              {savedTo
+                ? `Ecrit directement dans « ${savedTo} ».`
+                : "Le telechargement a demarre. Si rien ne s'est passe, verifie que ton navigateur ne bloque pas les telechargements automatiques."}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -207,10 +275,13 @@ export default function ExportPage() {
                 {report.fileName}
               </Badge>
               <Badge variant="outline">{humanSize(report.totalBytes)}</Badge>
-              <Badge variant="outline">{report.modsIncluded} mods</Badge>
+              <Badge variant="outline">{report.modsIncluded} elements</Badge>
               {report.modsLinked > 0 && <Badge variant="outline">{report.modsLinked} lies</Badge>}
               {report.modsBundled > 0 && (
                 <Badge variant="outline">{report.modsBundled} embarques</Badge>
+              )}
+              {report.modsFromManual > 0 && (
+                <Badge variant="outline">{report.modsFromManual} fournis a la main</Badge>
               )}
               <Badge variant="outline">{report.overridesWritten} fichiers</Badge>
               {report.overrideConflictsResolved > 0 && (
@@ -238,7 +309,7 @@ export default function ExportPage() {
                 <AlertDescription>
                   <ul className="mt-1 space-y-1">
                     {report.modsFailed.slice(0, 15).map((f) => (
-                      <li key={f.name}>
+                      <li key={f.key}>
                         <strong>{f.name}</strong> — {f.reason}
                       </li>
                     ))}
@@ -246,6 +317,10 @@ export default function ExportPage() {
                       <li>…et {report.modsFailed.length - 15} autres, listes dans le rapport.</li>
                     )}
                   </ul>
+                  <p className="mt-2">
+                    Ils sont desormais listes dans « Telechargements manuels » plus haut :
+                    ouvre leur page, recupere le fichier, et relance la generation.
+                  </p>
                 </AlertDescription>
               </Alert>
             )}
@@ -254,6 +329,20 @@ export default function ExportPage() {
       )}
     </>
   );
+}
+
+/**
+ * Nom propose dans la fenetre d'enregistrement. Le builder recalcule le nom
+ * definitif ; ici il s'agit seulement de pre-remplir le champ.
+ */
+function suggestedFileName(target: { name: string; version: string }, format: ExportFormat) {
+  const safe =
+    target.name
+      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/ /g, "-") || "modpack";
+  return `${safe}-${target.version}.${format === "mrpack" ? "mrpack" : "zip"}`;
 }
 
 function Choice({

@@ -36,12 +36,19 @@ export async function dropAllArchives(): Promise<void> {
   );
 }
 
-/** Taille totale occupee, pour l'afficher dans les reglages. */
+/**
+ * Taille totale occupee, pour l'afficher dans les reglages.
+ *
+ * Les fichiers recuperes a la main comptent aussi : ils vivent dans le meme
+ * stockage et sont effaces par le meme bouton, les omettre donnerait un
+ * chiffre faux.
+ */
 export async function archivesFootprint(): Promise<number> {
   const all = await keys();
   let total = 0;
   for (const k of all) {
-    if (typeof k !== "string" || !k.startsWith(PREFIX)) continue;
+    if (typeof k !== "string") continue;
+    if (!k.startsWith(PREFIX) && !k.startsWith("modpack-merger.manual.")) continue;
     const blob = await get<Blob>(k);
     if (blob) total += blob.size;
   }

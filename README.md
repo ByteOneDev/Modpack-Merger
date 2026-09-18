@@ -57,14 +57,24 @@ npm run deploy
 
 et `npm run preview` lance le tout en local, Worker compris.
 
-### GitHub Pages
+### Hébergement purement statique (GitHub Pages et autres)
 
-Le workflow `.github/workflows/deploy.yml` construit et publie à chaque push
-sur `main`. Dans **Settings → Pages**, choisis la source **GitHub Actions**.
+`npm run build` produit dans `out/` un site qui se dépose tel quel sur
+n'importe quel hébergement statique. Pour un « project site » GitHub Pages,
+servi sous `/<nom-du-depot>/`, il faut indiquer le préfixe :
 
-Le `basePath` est calculé d'après le nom du dépôt. GitHub Pages n'exécute
-aucun code : CurseForge restera inactif tant que tu n'auras pas déployé le
-Worker autonome de `proxy/` et collé son URL dans les paramètres.
+```bash
+NEXT_PUBLIC_BASE_PATH=/Modpack-Merger npm run build
+```
+
+Aucun workflow n'est fourni : le dépôt vise Cloudflare Workers, et publier
+aussi sur Pages ferait cohabiter deux déploiements divergents. Si tu en veux
+un, `actions/upload-pages-artifact` puis `actions/deploy-pages` sur le dossier
+`out/` suffisent.
+
+Un hébergement statique n'exécute aucun code : **CurseForge y restera
+inactif** tant que tu n'auras pas déployé le Worker autonome de `proxy/` et
+collé son URL dans les paramètres de l'application.
 
 ### Construire à la main
 
@@ -122,6 +132,11 @@ Trois formats, détectés automatiquement, sans limite de nombre :
 | CurseForge `.zip` | `manifest.json` | numéros projet/fichier (via le relais) |
 | Archive brute | présence de `mods/*.jar` | sha1 (Modrinth) et empreinte murmur2 (CurseForge) |
 
+Un pack ne contient pas que des mods : les `resourcepacks/`, `shaderpacks/` et
+`datapacks/` déclarés dans un manifeste sont reconnus comme du contenu à part
+entière, résolus sur les deux plateformes et replacés dans le bon dossier à
+l'export — pas recopiés en vrac.
+
 Pour une archive brute, chaque `.jar` est aussi ouvert pour lire ses
 métadonnées internes (`fabric.mod.json`, `quilt.mod.json`,
 `META-INF/mods.toml`, `META-INF/neoforge.mods.toml`), ce qui permet
@@ -134,10 +149,16 @@ d'identifier même un mod jamais publié.
 2. **Déduplication** — un mod présent dans plusieurs packs devient une seule
    entrée. La correspondance se fait sur l'identifiant de projet, le hash du
    fichier, le `modId` du jar ou le titre normalisé.
-3. **Résolution** — chaque mod est cherché dans la combinaison loader +
+3. **Résolution** — chaque contenu est cherché dans la combinaison loader +
    version demandée, dans sa version **la plus récente parmi les plus
    stables** : une release récente l'emporte sur une beta plus récente. Une
-   beta n'est retenue qu'à défaut, et elle est signalée.
+   beta n'est retenue qu'à défaut.
+
+   Quand une version plus récente existe mais a été écartée parce qu'instable,
+   **l'app le dit, version et canal à l'appui** — sans quoi rien ne distingue
+   « dernière version publiée » de « dernière version stable », et le choix
+   ressemble à un oubli. *Paramètres → Préférer une version stable* permet de
+   basculer sur la plus récente quoi qu'il arrive.
 4. **Dépendances** — les dépendances requises manquantes sont ajoutées
    récursivement, dans la bonne version.
 5. **Doublons fonctionnels** — des mods différents qui font la même chose sont
@@ -191,10 +212,59 @@ JVM prêts à copier, et **le détail complet du calcul** pour que tu puisses
 juger. Les ordres de grandeur obtenus : 50 mods → 4 Go, 150 mods → 6 Go,
 150 mods + shaders → 8 Go, 250 mods → 7,5 Go.
 
-### Ajout manuel
+### Ajouter du contenu
 
-Un champ de recherche permet d'ajouter n'importe quel mod des deux
-plateformes, dans sa version la plus récente compatible, avec ses dépendances.
+Un onglet par type, chacun avec son propre champ de recherche : **mods**,
+**resource packs**, **shaders**, **datapacks**, **schématiques**. Ce n'est pas
+cosmétique — chaque type se cherche différemment. Un resource pack n'est pas
+publié sous un mod loader mais sous `minecraft`, un shader sous `iris` ou
+`optifine`, un datapack sous `datapack` : interroger les API avec le loader du
+pack ne renverrait rien du tout.
+
+| Type | Modrinth | CurseForge | Destination |
+|---|---|---|---|
+| Mod | `project_type:mod` | classe 6 | `mods/` |
+| Resource pack | `project_type:resourcepack` | classe 12 | `resourcepacks/` |
+| Shader | `project_type:shader` | classe 6552 | `shaderpacks/` |
+| Datapack | `project_type:datapack` | classe 6945 | `datapacks/` |
+| Schématique | — | — | selon le mod détecté |
+
+**Les schématiques n'ont pas d'API.** Aucune bibliothèque connue n'expose
+d'interface interrogeable depuis un navigateur : `minecraft-schematics.com`
+répond derrière une protection anti-robot et sans en-têtes CORS, et ni
+Modrinth ni CurseForge n'ont de catégorie pour ce format. L'onglet ouvre donc
+les bibliothèques dans un onglet et accepte les fichiers `.litematic`,
+`.schem`, `.schematic` et `.nbt` déposés ensuite. Le dossier de destination
+suit le mod détecté dans le pack : `schematics/` pour Litematica ou
+Schematica, `config/worldedit/schematics/` pour WorldEdit, `blueprints/` pour
+Axiom. Si aucun de ces mods n'est présent, l'app le dit plutôt que de livrer
+des fichiers que rien ne pourra ouvrir.
+
+### Téléchargements manuels
+
+Certains auteurs interdisent la distribution de leur fichier par des tiers :
+CurseForge renvoie alors le fichier sans lien de téléchargement. **Le lien CDN
+resterait techniquement joignable ; l'outil ne l'utilise pas.** C'est un choix
+de l'auteur, et le contourner n'appartient pas à un outil de fusion.
+
+Le fonctionnement reprend celui de Prism Launcher : l'app ouvre la page du
+fichier exact — bonne version déjà sélectionnée — et récupère ensuite ce qui a
+été téléchargé. Deux façons de le lui rendre :
+
+- **déposer les fichiers** (fonctionne partout) ;
+- **autoriser une fois le dossier Téléchargements** : l'app le relit ensuite
+  d'un clic. Cela demande l'API File System Access, donc Chrome, Edge ou Opera
+  — une page web ne peut pas atteindre un dossier sans autorisation explicite,
+  et seuls les fichiers dont l'extension correspond à ce qui manque sont
+  ouverts.
+
+Les fichiers rendus sont **appariés par empreinte sha1**, pas par nom : un
+fichier renommé est reconnu, et une mauvaise version est détectée. Le repli par
+le nom existe, et l'app indique alors que l'empreinte n'a pas pu être
+confirmée.
+
+Les échecs de téléchargement d'un export précédent (CDN qui refuse la requête)
+rejoignent la même liste : le besoin est identique.
 
 ### Export
 
@@ -212,8 +282,32 @@ Et deux modes :
   des liens Modrinth, GitHub ou GitLab, donc les mods CurseForge sont de toute
   façon embarqués.
 
-L'archive contient toujours un `RAPPORT-DE-FUSION.md` : ce qui a été gardé,
-remplacé, écarté, abandonné, et la RAM recommandée avec son calcul.
+Un bouton **« Voir le récapitulatif »** ouvre l'inventaire avant génération :
+par type de contenu, et surtout **par côté** — ce qui est client uniquement,
+serveur uniquement, ou nécessaire des deux côtés, avec le poids correspondant.
+C'est la liste qu'il faut pour monter un serveur dédié sans y copier des
+shaders. Un troisième onglet montre les dépendances et ce qui les exige.
+
+L'archive contient toujours un `RAPPORT-DE-FUSION.md` : l'inventaire complet
+par type, la répartition client/serveur, ce qui a été gardé, remplacé, écarté,
+abandonné, et la RAM recommandée avec son calcul.
+
+#### Archives volumineuses
+
+L'archive est écrite **en flux**, entrée par entrée : rien n'est assemblé en
+mémoire. Un pack complet de 400 mods pèse facilement plus d'un gigaoctet, bien
+au-delà de ce qu'un seul tableau d'octets peut couvrir dans un onglet — c'est
+ce qui produisait l'erreur `Array buffer allocation failed`.
+
+Les `.jar` sont stockés tels quels plutôt que recompressés : ce sont déjà des
+archives, la recompression coûte du temps pour zéro octet gagné.
+
+Quand le navigateur le permet (Chrome, Edge, Opera), l'app demande **où
+enregistrer avant de commencer** et écrit directement dans ce fichier : le pic
+mémoire reste de quelques mégaoctets quelle que soit la taille finale, et il
+n'y a plus aucune limite. Ailleurs, l'archive est assemblée en `Blob` puis
+téléchargée — ce qui fonctionne, mais le stockage de Blobs du navigateur a lui
+aussi un plafond, autour de 2 Go.
 
 ## Architecture
 
@@ -237,8 +331,13 @@ src/
         alternatives.ts   recherche et notation des remplaçants
         overrides.ts      fusion N-way des fichiers de config
         ram.ts            estimation de mémoire
+      content.ts          types de contenu : dossiers, catégories d'API, côté
+      summary.ts          inventaire du pack, par type et par côté
       parse.ts            lecture des trois formats de pack
+      zip.ts              lecture protégée et écriture en flux des archives
       build.ts            génération de l'archive
+    manual.ts             fichiers récupérés à la main (appariement, dossier surveillé)
+    save.ts               destination de l'archive : disque en flux ou Blob
     store.tsx             état de l'assistant (React context + IndexedDB)
     settings.ts           préférences (localStorage)
 worker/                 code serveur (relais CurseForge et téléchargements)
@@ -280,6 +379,7 @@ L'app est publique et avale des archives fournies par n'importe qui. Ce qui a
 | **SSRF** | Le relais de téléchargement n'accepte qu'une liste blanche de CDN, impose HTTPS, et **revalide la destination après chaque redirection** plutôt que de les suivre aveuglément. |
 | **Proxy ouvert** | Le relais CurseForge ne transmet qu'une liste fermée de routes, ne recopie que les paramètres de requête attendus, plafonne les corps POST à 256 Ko et restreint l'origine appelante. |
 | **Fuite de clé** | La clé CurseForge vit dans une variable d'environnement côté serveur et n'atteint jamais le navigateur. Le champ « clé API » côté client n'apparaît que si un relais externe est configuré, et prévient qu'il est déconseillé. |
+| **Accès aux fichiers locaux** | Le dossier surveillé et la destination d'écriture sont choisis par l'utilisateur dans une fenêtre du système ; une page web ne peut pas y accéder autrement. À la relecture, seuls les fichiers dont l'extension correspond à ce qui manque sont ouverts. Rien ne quitte la machine. |
 | **XSS** | Aucun `innerHTML` ni `eval`. Le seul script inline est une chaîne littérale qui applique le thème avant le premier rendu. Tout le contenu venant des API est rendu comme texte par React. |
 | **Clickjacking, sniffing** | `deploy/_headers` pose `X-Frame-Options`, `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy` et une `Permissions-Policy` restrictive. GitHub Pages ne permet pas de définir d'en-têtes. |
 
@@ -300,11 +400,18 @@ quota CurseForge. Renseigne `ALLOWED_ORIGIN` (Worker du site) ou `ALLOWED_ORIGIN
 
 - **Sans relais CurseForge**, la moitié du catalogue est hors de portée.
 - Le téléchargement des jars se fait depuis le navigateur : certains CDN
-  refusent les requêtes venant d'une page web. Les mods concernés sont listés
-  à la fin de l'export, à récupérer à la main. Le mode *manifeste seul* évite
-  le problème.
+  refusent les requêtes venant d'une page web. Les mods concernés basculent
+  dans *Téléchargements manuels*. Le mode *manifeste seul* évite le problème.
 - Un mod dont l'auteur a désactivé la distribution tierce sur CurseForge ne
-  peut pas être embarqué. C'est une limite de la plateforme.
+  peut pas être téléchargé automatiquement — par respect de son choix, pas par
+  impossibilité technique. L'écran *Téléchargements manuels* ouvre sa page et
+  récupère le fichier.
+- La lecture automatique du dossier Téléchargements demande Chrome, Edge ou
+  Opera. Sur Firefox et Safari, il faut déposer les fichiers.
+- Sur Firefox et Safari, l'archive passe par un `Blob` : au-delà d'environ
+  2 Go, préférer le mode *manifeste seul*.
+- Les schématiques ne se cherchent pas automatiquement : aucune bibliothèque
+  n'expose d'API utilisable depuis un navigateur.
 - La fusion ligne à ligne des configs traite le JSON et les formats clé=valeur
   (`toml`, `cfg`, `properties`, `ini`). Les autres formats demandent de choisir
   une version.

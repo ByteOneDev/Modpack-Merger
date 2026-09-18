@@ -6,7 +6,7 @@ import {
   type ProviderId,
 } from "../types";
 import { providerOf } from "../providers";
-import { pickBestVersion } from "./resolve";
+import { newerThanPicked, pickBestVersion } from "./resolve";
 
 /**
  * Ajoute les dependances requises manquantes.
@@ -65,16 +65,28 @@ export async function resolveDependencies(
     for (const [id, { provider, id: projectId, by }] of wanted) {
       present.add(id); // marque avant resolution : evite les doublons concurrents
 
-      const [versions, project] = await Promise.all([
+      const [firstTry, project] = await Promise.all([
         providerOf(provider).getVersions(projectId, loaders, mc).catch(() => []),
         providerOf(provider).getProject(projectId).catch(() => null),
       ]);
-      const picked = pickBestVersion(versions, target);
+      let versions = firstTry;
+      // Les deux appels partent ensemble pour la vitesse, donc le premier
+      // ignore le type. Si la dependance n'est pas un mod, il a interroge les
+      // mauvais loaders : on rejoue une fois, avec la bonne categorie.
+      const kind = project?.kind ?? "mod";
+      if (!versions.length && kind !== "mod") {
+        versions = await providerOf(provider)
+          .getVersions(projectId, loaders, mc, kind)
+          .catch(() => []);
+      }
+      const picked = pickBestVersion(versions, target, true, kind);
+      const newer = picked ? newerThanPicked(picked, versions, target, kind) : null;
       const name = project?.title ?? `Dependance ${projectId}`;
 
       const source: PackMod = {
         key: `dep-${provider}-${projectId}`,
         name,
+        kind: project?.kind ?? "mod",
         slug: project?.slug,
         provider,
         projectId,
@@ -95,17 +107,26 @@ export async function resolveDependencies(
         ? {
             key: source.key,
             name,
+            kind: source.kind,
             from: { kind: "dependency" },
             status: "ok",
             source,
             picked,
             project: project ?? undefined,
             unstable: picked.versionType !== "release",
+            newerAvailable: newer
+              ? {
+                  versionNumber: newer.versionNumber,
+                  versionType: newer.versionType,
+                  datePublished: newer.datePublished,
+                }
+              : undefined,
             reason: `Dependance requise par ${by.join(", ")} — ${picked.versionNumber}`,
           }
         : {
             key: source.key,
             name,
+            kind: source.kind,
             from: { kind: "dependency" },
             status: "missing",
             source,

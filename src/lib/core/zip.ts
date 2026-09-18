@@ -1,4 +1,6 @@
-import { unzipSync, zipSync, strFromU8, strToU8 } from "fflate";
+import {
+  unzipSync, zipSync, strFromU8, strToU8, Zip, ZipDeflate, ZipPassThrough,
+} from "fflate";
 
 export type ZipEntries = Record<string, Uint8Array>;
 
@@ -142,13 +144,21 @@ export function surveyZip(buf: Uint8Array): ZipSurvey {
   };
 }
 
-export function readZip(buf: Uint8Array): ZipEntries {
+/**
+ * @param keep filtre applique *avant* decompression. Sauter les jars quand on
+ *   ne veut que les fichiers de configuration evite de charger plusieurs Go
+ *   en memoire pour rien.
+ */
+export function readZip(buf: Uint8Array, keep?: (path: string) => boolean): ZipEntries {
   if (buf.length > ZIP_LIMITS.maxArchiveBytes) {
     throw new ZipRejected("Archive refusee : plus de 4 Go.");
   }
   surveyZip(buf);
 
-  const raw = unzipSync(buf);
+  const raw = unzipSync(
+    buf,
+    keep ? { filter: (f) => keep(normalizePath(f.name)) } : undefined,
+  );
   // Prototype nul : les noms d'entrees viennent de l'archive, ils ne doivent
   // pas pouvoir atteindre Object.prototype en devenant des clefs.
   const out: ZipEntries = Object.create(null) as ZipEntries;
@@ -168,6 +178,159 @@ export function writeZip(entries: ZipEntries, level: 0 | 6 | 9 = 6): Uint8Array 
     if (isSafePath(clean)) safe[clean] = data;
   }
   return zipSync(safe, { level });
+}
+
+/* ------------------------------------------------------------------ */
+/* Ecriture en flux                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Au-dela de ~32 Mo accumules, les morceaux sont replies dans un Blob.
+ *
+ * Un Blob n'occupe pas le tas JavaScript : le navigateur est libre de le
+ * garder sur disque. C'est ce qui permet de produire une archive de plusieurs
+ * Go la ou un unique Uint8Array echouerait sur "Array buffer allocation
+ * failed" — la memoire contigue adressable par un onglet est bornee, quelle
+ * que soit la RAM de la machine.
+ */
+const FLUSH_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Destination d'ecriture directe, quand le navigateur en propose une.
+ *
+ * Ecrire au fil de l'eau dans un fichier choisi par l'utilisateur evite de
+ * detenir l'archive : ni en memoire, ni dans le stockage de Blobs du
+ * navigateur, qui a lui aussi un plafond.
+ */
+export interface ZipSink {
+  write: (chunk: Uint8Array) => Promise<void>;
+  close: () => Promise<void>;
+  abort?: () => Promise<void>;
+}
+
+/**
+ * Archive construite fichier par fichier.
+ *
+ * Contrairement a writeZip, rien n'est conserve en entier : chaque entree est
+ * poussee puis relachee. Un pack complet de 400 mods represente facilement
+ * 1,5 Go, soit bien au-dela de ce qu'un seul tableau d'octets peut couvrir.
+ */
+export class ZipStream {
+  private readonly zip: Zip;
+  private parts: BlobPart[] = [];
+  private buffered: Uint8Array[] = [];
+  private bufferedBytes = 0;
+  private written = 0;
+  private failure: Error | null = null;
+  private finished = false;
+  private onFinished: (() => void) | null = null;
+  /** ecritures en attente vers le disque, enchainees pour rester ordonnees */
+  private pending: Promise<void> = Promise.resolve();
+
+  constructor(private readonly sink?: ZipSink) {
+    this.zip = new Zip((err, data, final) => {
+      if (err) {
+        this.failure = err instanceof Error ? err : new Error(String(err));
+        return;
+      }
+      if (data) {
+        this.written += data.length;
+        if (this.sink) {
+          // fflate peut reutiliser ses tampons : on copie avant de differer.
+          const copy = data.slice();
+          const s = this.sink;
+          this.pending = this.pending.then(() => s.write(copy)).catch((e) => {
+            this.failure = e instanceof Error ? e : new Error(String(e));
+          });
+        } else {
+          this.buffered.push(data);
+          this.bufferedBytes += data.length;
+          if (this.bufferedBytes >= FLUSH_BYTES) this.spill();
+        }
+      }
+      if (final) {
+        this.finished = true;
+        this.onFinished?.();
+      }
+    });
+  }
+
+  private spill(): void {
+    if (!this.buffered.length) return;
+    this.parts.push(new Blob(this.buffered as BlobPart[]));
+    this.buffered = [];
+    this.bufferedBytes = 0;
+  }
+
+  /**
+   * Attend que tout ce qui a ete pousse soit reellement ecrit.
+   *
+   * A appeler entre deux gros fichiers : sans cela les ecritures disque
+   * s'accumuleraient en memoire, ce que le mode flux cherche justement a
+   * eviter.
+   */
+  async drain(): Promise<void> {
+    if (this.sink) await this.pending;
+    if (this.failure) throw this.failure;
+  }
+
+  /**
+   * @param compress a laisser a false pour un .jar : c'est deja une archive
+   *   compressee, la recompresser coute du temps pour ~0 octet gagne.
+   */
+  add(name: string, data: Uint8Array, compress = false): boolean {
+    if (this.failure) throw this.failure;
+    const clean = normalizePath(name);
+    if (!isSafePath(clean)) return false;
+
+    const entry = compress
+      ? new ZipDeflate(clean, { level: 6 })
+      : new ZipPassThrough(clean);
+    this.zip.add(entry);
+    // Pousse en un seul bloc, donc immediatement emis : fflate n'a jamais a
+    // mettre une entree en attente derriere une autre.
+    entry.push(data, true);
+
+    if (this.failure) throw this.failure;
+    return true;
+  }
+
+  /** Octets deja ecrits, pour afficher la taille pendant la generation. */
+  get bytesWritten(): number {
+    return this.written;
+  }
+
+  /**
+   * Termine l'archive. Renvoie un Blob en l'absence de destination disque,
+   * null quand tout a deja ete ecrit dans le fichier choisi.
+   */
+  async finish(): Promise<Blob | null> {
+    if (this.failure) throw this.failure;
+    await new Promise<void>((resolve) => {
+      this.onFinished = resolve;
+      this.zip.end();
+      if (this.finished) resolve();
+    });
+    if (this.sink) {
+      await this.pending;
+      if (this.failure) throw this.failure;
+      await this.sink.close();
+      return null;
+    }
+    if (this.failure) throw this.failure;
+    this.spill();
+    return new Blob(this.parts, { type: "application/zip" });
+  }
+
+  /** Abandonne l'ecriture en cours, pour ne pas laisser un fichier tronque. */
+  async abort(): Promise<void> {
+    await this.sink?.abort?.().catch(() => {});
+  }
+}
+
+/** Extensions deja compressees : les stocker tel quel plutot que les deflater. */
+export function isPrecompressed(path: string): boolean {
+  return /\.(jar|zip|png|jpg|jpeg|webp|ogg|mp3|litematic|schem|nbt|gz|xz|7z)$/i.test(path);
 }
 
 export function readText(entries: ZipEntries, path: string): string | null {

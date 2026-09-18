@@ -1,3 +1,7 @@
+import type { ContentKind } from "./content";
+
+export type { ContentKind };
+
 export type LoaderId = "fabric" | "forge" | "neoforge" | "quilt";
 
 export const LOADERS: LoaderId[] = ["fabric", "neoforge", "forge", "quilt"];
@@ -34,6 +38,8 @@ export interface PackMod {
   key: string;
   name: string;
   slug?: string;
+  /** mod, resource pack, shader… ; "mod" par defaut */
+  kind: ContentKind;
   provider: ProviderId | "unknown";
   projectId?: string;
   fileId?: string;
@@ -64,6 +70,12 @@ export interface ParsedPack {
   mods: PackMod[];
   /** chemins des fichiers d'instance, pour l'apercu seulement */
   overridePaths: string[];
+  /**
+   * Racine commune d'une archive brute ("MonPack/mods/x.jar" -> "MonPack/").
+   * Retenue au parsing : elle se deduit des chemins de jars, qu'une relecture
+   * ulterieure peut avoir volontairement ecartes.
+   */
+  rootPrefix?: string;
   extraDownloads: PackMod[];
   warnings: string[];
   fileName: string;
@@ -93,6 +105,15 @@ export interface ProviderVersion {
   downloadUrl: string | null;
   hashes: { sha1?: string; sha512?: string };
   dependencies: ProviderDependency[];
+  /**
+   * L'auteur a refuse la distribution par des tiers : le fichier existe, mais
+   * seul un telechargement depuis sa page le rend disponible legitimement.
+   */
+  manualOnly?: boolean;
+  /** page de telechargement de ce fichier precis, pour le mode manuel */
+  pageUrl?: string;
+  /** fichier apporte par l'utilisateur : aucune plateforme derriere */
+  local?: boolean;
 }
 
 export interface ProviderDependency {
@@ -105,6 +126,7 @@ export interface ProviderDependency {
 export interface ProviderProject {
   provider: ProviderId;
   projectId: string;
+  kind: ContentKind;
   slug: string;
   title: string;
   description: string;
@@ -118,6 +140,8 @@ export interface ProviderProject {
   clientSide?: EnvSupport;
   serverSide?: EnvSupport;
   url: string;
+  /** false quand l'auteur interdit la distribution par des tiers */
+  allowDistribution?: boolean;
 }
 
 export type ResolutionStatus =
@@ -130,6 +154,7 @@ export type ResolutionStatus =
 export interface ModResolution {
   key: string;
   name: string;
+  kind: ContentKind;
   from: ModSource;
   status: ResolutionStatus;
   reason: string;
@@ -139,6 +164,13 @@ export interface ModResolution {
   /** etiquettes des packs qui apportaient ce meme mod */
   mergedFrom?: string[];
   unstable?: boolean;
+  /**
+   * Version plus recente existante mais ecartee parce qu'instable. Sert a
+   * montrer que le choix est delibere et non une version oubliee.
+   */
+  newerAvailable?: { versionNumber: string; versionType: string; datePublished: string };
+  /** fichier fourni a la main par l'utilisateur (voir lib/manual.ts) */
+  manualFile?: { fileName: string; size: number; sha1: string };
 }
 
 export interface Alternative {

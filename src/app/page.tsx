@@ -153,7 +153,8 @@ export default function PacksPage() {
         <Card className="mb-6">
           <CardHeader>
             <CardTitle>
-              {packs.length} pack{packs.length > 1 ? "s" : ""} · {totalMods} mods au total
+              {packs.length} pack{packs.length > 1 ? "s" : ""} · {totalMods} element
+              {totalMods > 1 ? "s" : ""} au total
             </CardTitle>
             <CardDescription>
               L&apos;ordre compte : en cas de valeur contradictoire dans un fichier de
@@ -180,7 +181,9 @@ export default function PacksPage() {
                     <span>·</span>
                     <span>{humanSize(pack.fileSize)}</span>
                     <span>·</span>
-                    <span>{pack.mods.length} mods</span>
+                    <span>
+                      {pack.mods.length} element{pack.mods.length > 1 ? "s" : ""}
+                    </span>
                     {pack.overridePaths.length > 0 && (
                       <>
                         <span>·</span>

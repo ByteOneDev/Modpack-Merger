@@ -9,6 +9,7 @@ import {
 } from "../types";
 import { modrinth, curseforge, providerOf, normalizeTitle } from "../providers";
 import { LOADER_ONLY } from "./knowledge";
+import { CONTENT_INFO, providerLoaders, type ContentKind } from "../content";
 
 /* ------------------------------------------------------------------ */
 /* Deduplication                                                       */
@@ -80,15 +81,32 @@ const TYPE_RANK = { release: 0, beta: 1, alpha: 2 } as const;
  * recente bat toujours une beta plus recente. Une beta n'est retenue qu'en
  * l'absence de release, sauf si preferStable est desactive.
  */
+/**
+ * Versions acceptables pour ce type de contenu.
+ *
+ * Un resource pack n'est publie sous aucun mod loader — il l'est sous
+ * "minecraft" — et un shader sous "iris" ou "optifine". Leur appliquer la
+ * compatibilite entre loaders de mods revient a tout rejeter.
+ */
+function acceptsLoader(v: ProviderVersion, target: MergeTarget, kind: ContentKind): boolean {
+  if (kind === "mod") {
+    return v.loaders.some((l) => LOADER_COMPAT[target.loader].includes(l as LoaderId));
+  }
+  const allowed = providerLoaders(kind, LOADER_COMPAT[target.loader]);
+  // CurseForge ne declare pas de loader pour un resource pack : une liste
+  // vide veut dire "pas concerne", pas "incompatible".
+  if (!allowed.length || !v.loaders.length) return true;
+  return v.loaders.some((l) => allowed.includes(l));
+}
+
 export function pickBestVersion(
   versions: ProviderVersion[],
   target: MergeTarget,
   preferStable = true,
+  kind: ContentKind = "mod",
 ): ProviderVersion | null {
   const pool = versions.filter(
-    (v) =>
-      v.gameVersions.includes(target.minecraft) &&
-      v.loaders.some((l) => LOADER_COMPAT[target.loader].includes(l as LoaderId)),
+    (v) => v.gameVersions.includes(target.minecraft) && acceptsLoader(v, target, kind),
   );
   if (!pool.length) return null;
 
@@ -97,11 +115,41 @@ export function pickBestVersion(
       const rank = TYPE_RANK[a.versionType] - TYPE_RANK[b.versionType];
       if (rank !== 0) return rank;
     }
-    const exactA = a.loaders.includes(target.loader) ? 0 : 1;
-    const exactB = b.loaders.includes(target.loader) ? 0 : 1;
-    if (exactA !== exactB) return exactA - exactB;
+    if (kind === "mod") {
+      const exactA = a.loaders.includes(target.loader) ? 0 : 1;
+      const exactB = b.loaders.includes(target.loader) ? 0 : 1;
+      if (exactA !== exactB) return exactA - exactB;
+    }
     return new Date(b.datePublished).getTime() - new Date(a.datePublished).getTime();
   })[0];
+}
+
+/**
+ * Version publiee plus recemment que celle retenue.
+ *
+ * `pickBestVersion` privilegie une release meme si une beta plus recente
+ * existe. C'est le bon defaut, mais il faut pouvoir le dire : sans cela, rien
+ * ne distingue "derniere version publiee" de "derniere version stable", et
+ * l'utilisateur ne peut pas verifier que le choix est delibere.
+ */
+export function newerThanPicked(
+  picked: ProviderVersion,
+  pool: ProviderVersion[],
+  target: MergeTarget,
+  kind: ContentKind = "mod",
+): ProviderVersion | null {
+  const pickedAt = new Date(picked.datePublished).getTime();
+  const candidates = pool.filter(
+    (v) =>
+      v.versionId !== picked.versionId &&
+      v.gameVersions.includes(target.minecraft) &&
+      acceptsLoader(v, target, kind) &&
+      new Date(v.datePublished).getTime() > pickedAt,
+  );
+  if (!candidates.length) return null;
+  return candidates.sort(
+    (a, b) => new Date(b.datePublished).getTime() - new Date(a.datePublished).getTime(),
+  )[0];
 }
 
 /* ------------------------------------------------------------------ */
@@ -118,7 +166,7 @@ async function findVersions(
   // 1. le projet est connu : on interroge directement sa source
   if (mod.provider !== "unknown" && mod.projectId) {
     const versions = await providerOf(mod.provider)
-      .getVersions(mod.projectId, loaders, mc)
+      .getVersions(mod.projectId, loaders, mc, mod.kind)
       .catch(() => []);
     if (versions.length) {
       const project =
@@ -130,7 +178,7 @@ async function findVersions(
   // 2. le meme mod publie sur l'autre plateforme
   const slug = mod.slug ?? normalizeTitle(mod.name);
   if (mod.provider !== "modrinth" && slug) {
-    const versions = await modrinth.getVersions(slug, loaders, mc).catch(() => []);
+    const versions = await modrinth.getVersions(slug, loaders, mc, mod.kind).catch(() => []);
     if (versions.length) {
       const project = (await modrinth.getProject(slug).catch(() => null)) ?? undefined;
       return { versions, project };
@@ -140,19 +188,25 @@ async function findVersions(
   // 3. recherche par nom, acceptee seulement si le titre correspond vraiment :
   //    mieux vaut declarer un mod introuvable que le remplacer au hasard.
   const wanted = normalizeTitle(mod.name);
-  const hits = await modrinth.search(mod.name, loaders, target.minecraft, 5).catch(() => []);
+  const hits = await modrinth
+    .search(mod.name, loaders, target.minecraft, 5, mod.kind)
+    .catch(() => []);
   const exact = hits.find((h) => normalizeTitle(h.title) === wanted);
   if (exact) {
-    const versions = await modrinth.getVersions(exact.projectId, loaders, mc).catch(() => []);
+    const versions = await modrinth
+      .getVersions(exact.projectId, loaders, mc, mod.kind)
+      .catch(() => []);
     if (versions.length) return { versions, project: exact };
   }
 
   if (curseforge.available()) {
-    const cfHits = await curseforge.search(mod.name, loaders, target.minecraft, 5).catch(() => []);
+    const cfHits = await curseforge
+      .search(mod.name, loaders, target.minecraft, 5, mod.kind)
+      .catch(() => []);
     const cfExact = cfHits.find((h) => normalizeTitle(h.title) === wanted);
     if (cfExact) {
       const versions = await curseforge
-        .getVersions(cfExact.projectId, loaders, mc)
+        .getVersions(cfExact.projectId, loaders, mc, mod.kind)
         .catch(() => []);
       if (versions.length) return { versions, project: cfExact };
     }
@@ -170,6 +224,7 @@ export async function resolveMod(
   const base = {
     key: mod.key,
     name: mod.name,
+    kind: mod.kind,
     from: mod.from,
     source: mod,
     mergedFrom: group.labels.length > 1 ? group.labels : undefined,
@@ -178,7 +233,10 @@ export async function resolveMod(
   // Mods qui n'ont de sens que sur certains loaders : leur absence sur la
   // cible est attendue, ce n'est pas un echec.
   const loaderOnly =
-    LOADER_ONLY[(mod.slug ?? "").toLowerCase()] ?? LOADER_ONLY[(mod.modId ?? "").toLowerCase()];
+    mod.kind === "mod"
+      ? (LOADER_ONLY[(mod.slug ?? "").toLowerCase()] ??
+        LOADER_ONLY[(mod.modId ?? "").toLowerCase()])
+      : undefined;
   if (loaderOnly && !loaderOnly.includes(target.loader)) {
     return {
       ...base,
@@ -188,14 +246,17 @@ export async function resolveMod(
   }
 
   const { versions, project } = await findVersions(mod, target);
-  const picked = pickBestVersion(versions, target, preferStable);
+  const picked = pickBestVersion(versions, target, preferStable, mod.kind);
 
   if (!picked) {
     return {
       ...base,
       status: "missing",
       project,
-      reason: `Aucune version pour ${target.loader} ${target.minecraft}.`,
+      reason:
+        mod.kind === "mod"
+          ? `Aucune version pour ${target.loader} ${target.minecraft}.`
+          : `Aucun ${CONTENT_INFO[mod.kind].label} compatible avec Minecraft ${target.minecraft}.`,
     };
   }
 
@@ -204,9 +265,16 @@ export async function resolveMod(
     !picked.loaders.includes(target.loader) &&
     picked.loaders.some((l) => LOADER_COMPAT[target.loader].includes(l as LoaderId));
 
+  const newer = newerThanPicked(picked, versions, target, mod.kind);
+
   const reasons = [`${picked.versionNumber} (${picked.versionType})`];
   if (viaCompat) reasons.push(`charge via la compatibilite ${picked.loaders[0]} de ${target.loader}`);
   if (unstable) reasons.push("aucune release stable pour cette version");
+  if (newer) {
+    reasons.push(
+      `${newer.versionNumber} est plus recente mais en ${newer.versionType}, donc ecartee`,
+    );
+  }
   if (group.labels.length > 1) reasons.push(`apporte par les packs ${group.labels.join(", ")}`);
 
   return {
@@ -215,6 +283,13 @@ export async function resolveMod(
     picked,
     project,
     unstable,
+    newerAvailable: newer
+      ? {
+          versionNumber: newer.versionNumber,
+          versionType: newer.versionType,
+          datePublished: newer.datePublished,
+        }
+      : undefined,
     reason: reasons.join(" — "),
   };
 }
@@ -233,6 +308,7 @@ export async function resolveAll(
           (err): ModResolution => ({
             key: g.primary.key,
             name: g.primary.name,
+            kind: g.primary.kind,
             from: g.primary.from,
             source: g.primary,
             status: "missing",

@@ -30,7 +30,9 @@ export async function readPackFiles(packs: ParsedPack[]): Promise<PackFiles[]> {
     out.push({
       packId: pack.id,
       label: pack.label,
-      files: extractOverrides(readZip(buf), pack),
+      // Les jars sont exclus avant decompression : ils representent l'essentiel
+      // du poids d'un pack et ne servent pas a comparer des configurations.
+      files: extractOverrides(readZip(buf, (path) => !/(^|\/)mods\/[^/]+\.jar$/i.test(path)), pack),
     });
   }
   return out;
@@ -101,5 +103,7 @@ export async function runAnalysis(
     decisions,
     ram,
     analyzed: true,
+    manualFiles: {},
+    failedDownloads: [],
   };
 }

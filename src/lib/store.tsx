@@ -15,6 +15,7 @@ import { DEFAULT_SETTINGS, loadSettings, saveSettings, applyTheme, type Settings
 import { setProviderConfig } from "@/lib/core/providers/config";
 import { detectRelay, type RelayStatus } from "@/lib/relay";
 import { dropAllArchives } from "@/lib/archives";
+import { dropAllManualFiles, type ManualFileInfo } from "@/lib/manual";
 
 const STATE_KEY = "modpack-merger.state.v1";
 
@@ -28,6 +29,13 @@ export interface MergeState {
   decisions: Record<string, OverrideDecision>;
   ram: RamEstimate | null;
   analyzed: boolean;
+  /**
+   * Fichiers fournis a la main, par cle de resolution. Seules les
+   * metadonnees vivent ici : le contenu est dans IndexedDB.
+   */
+  manualFiles: Record<string, ManualFileInfo>;
+  /** cles dont le telechargement automatique a echoue au dernier export */
+  failedDownloads: string[];
 }
 
 const EMPTY: MergeState = {
@@ -40,6 +48,8 @@ const EMPTY: MergeState = {
   decisions: {},
   ram: null,
   analyzed: false,
+  manualFiles: {},
+  failedDownloads: [],
 };
 
 interface Ctx {
@@ -119,7 +129,11 @@ export function MergeProvider({ children }: { children: React.ReactNode }) {
 
   const reset = React.useCallback(async () => {
     setState(EMPTY);
-    await Promise.all([idbDel(STATE_KEY).catch(() => {}), dropAllArchives().catch(() => {})]);
+    await Promise.all([
+      idbDel(STATE_KEY).catch(() => {}),
+      dropAllArchives().catch(() => {}),
+      dropAllManualFiles().catch(() => {}),
+    ]);
   }, []);
 
   const value = React.useMemo(

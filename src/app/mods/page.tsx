@@ -11,7 +11,7 @@ import { StepGuard } from "@/components/empty-state";
 import { RamCard } from "@/components/ram-card";
 import { AlternativesList } from "@/components/alternatives";
 import { BulkAlternatives } from "@/components/bulk-alternatives";
-import { AddMod } from "@/components/add-mod";
+import { AddContent } from "@/components/add-content";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,8 +21,11 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useMerge } from "@/lib/store";
 import {
-  addMod, applyAlternative, applyAlternatives, excludeMod, resolveConflict, restoreMod,
+  addMod, addSchematics, applyAlternative, applyAlternatives, excludeMod, resolveConflict,
+  restoreMod,
 } from "@/lib/actions";
+import { detectSchematicFolder } from "@/lib/core/build";
+import { CONTENT_INFO, SCHEMATIC_MODS, countLabel, type ContentKind } from "@/lib/core/content";
 import type { ModResolution } from "@/lib/core/types";
 
 export default function ModsPage() {
@@ -39,6 +42,9 @@ export default function ModsPage() {
   );
   const deps = state.resolutions.filter((r) => r.from.kind === "dependency");
   const hardConflicts = state.conflicts.filter((c) => c.severity === "hard");
+  const byKind = (Object.keys(CONTENT_INFO) as ContentKind[])
+    .map((k) => ({ kind: k, count: [...kept, ...substituted].filter((r) => r.kind === k).length }))
+    .filter((g) => g.count > 0);
 
   if (!hydrated) return null;
   if (!state.analyzed || !state.target) {
@@ -58,7 +64,7 @@ export default function ModsPage() {
     <>
       <PageHeader
         title="Resultat de la fusion"
-        description={`${kept.length + substituted.length} mods retenus pour ${target.loader} ${target.minecraft}, a partir de ${state.packs.length} packs.`}
+        description={`${kept.length + substituted.length} elements retenus pour ${target.loader} ${target.minecraft}, a partir de ${state.packs.length} packs.`}
         action={
           <Button onClick={() => router.push("/fichiers/")}>
             Continuer <ArrowRight />
@@ -66,8 +72,18 @@ export default function ModsPage() {
         }
       />
 
+      {byKind.length > 1 && (
+        <div className="mb-4 flex flex-wrap gap-2">
+          {byKind.map((g) => (
+            <Badge key={g.kind} variant="secondary">
+              {countLabel(g.kind, g.count)}
+            </Badge>
+          ))}
+        </div>
+      )}
+
       <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-        <Stat label="Mods retenus" value={kept.length + substituted.length} tone="success" />
+        <Stat label="Elements retenus" value={kept.length + substituted.length} tone="success" />
         <Stat label="Introuvables" value={missing.length} tone={missing.length ? "danger" : undefined} />
         <Stat label="Dependances ajoutees" value={deps.length} tone="info" />
         <Stat
@@ -211,12 +227,19 @@ export default function ModsPage() {
       )}
 
       <div className="mb-6">
-        <AddMod
+        <AddContent
           target={target}
-          onAdd={async (provider, projectId) => {
-            const patch = await addMod(state, provider, projectId, settings);
+          schematicFolder={detectSchematicFolder(state.resolutions)}
+          schematicMod={detectSchematicMod(state.resolutions)}
+          onAdd={async (provider, projectId, kind) => {
+            const patch = await addMod(state, provider, projectId, settings, kind);
             if (!patch.error) setState((prev) => ({ ...prev, ...patch }));
             return patch;
+          }}
+          onAddSchematics={(files) => {
+            void addSchematics(state, files, settings).then((patch) =>
+              setState((prev) => ({ ...prev, ...patch })),
+            );
           }}
         />
       </div>
@@ -334,6 +357,18 @@ export default function ModsPage() {
   );
 }
 
+/** Nom du mod a schematiques present dans le pack, s'il y en a un. */
+function detectSchematicMod(resolutions: ModResolution[]): string | null {
+  for (const r of resolutions) {
+    if (r.status !== "ok" && r.status !== "substituted") continue;
+    const hit =
+      SCHEMATIC_MODS[(r.project?.slug ?? "").toLowerCase()] ??
+      SCHEMATIC_MODS[(r.source?.slug ?? "").toLowerCase()];
+    if (hit) return hit.label;
+  }
+  return null;
+}
+
 function Stat({
   label,
   value,
@@ -384,6 +419,7 @@ function ModList({
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-sm font-medium">{r.name}</span>
+              {r.kind !== "mod" && <Badge variant="outline">{CONTENT_INFO[r.kind].label}</Badge>}
               {r.from.kind === "dependency" && <Badge variant="info">dependance</Badge>}
               {r.from.kind === "manual" && <Badge variant="secondary">ajoute</Badge>}
               {r.mergedFrom && r.mergedFrom.length > 1 && (
@@ -395,6 +431,12 @@ function ModList({
               )}
             </div>
             <p className="text-muted-foreground mt-0.5 text-xs text-pretty">{r.reason}</p>
+            {r.newerAvailable && (
+              <p className="text-warning mt-0.5 text-[11px]">
+                Version plus recente publiee : {r.newerAvailable.versionNumber} (
+                {r.newerAvailable.versionType}) — ecartee car non stable.
+              </p>
+            )}
           </div>
           <div className="shrink-0">{action(r)}</div>
         </div>

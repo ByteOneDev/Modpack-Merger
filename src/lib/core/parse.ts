@@ -2,6 +2,7 @@ import { readZip, readJson, type ZipEntries } from "./zip";
 import { sha1, curseforgeFingerprint } from "./hash";
 import { readJarMeta, nameFromFileName } from "./jarmeta";
 import { modrinth, curseforge } from "./providers";
+import { kindFromPath, CONTENT_INFO, type ContentKind } from "./content";
 import type {
   EnvSupport,
   LoaderId,
@@ -64,12 +65,12 @@ function loaderFromCfManifest(m: CfManifest) {
   return { loader, loaderVersion: rest.join("-") || undefined };
 }
 
-const EXTRA_DIRS = ["resourcepacks/", "shaderpacks/", "datapacks/", "plugins/"];
-
-function classifyPath(p: string): "mod" | "extra" | "override" {
-  if (p.startsWith("mods/")) return "mod";
-  if (EXTRA_DIRS.some((d) => p.startsWith(d))) return "extra";
-  return "override";
+/**
+ * Type de contenu d'une entree de manifeste. Un .mrpack declare ses resource
+ * packs et shaders au meme titre que ses mods, dans des dossiers differents.
+ */
+function classifyEntry(p: string): ContentKind | "override" {
+  return kindFromPath(p) ?? (p.startsWith("mods/") ? "mod" : "override");
 }
 
 function modrinthIdsFromUrl(url: string | undefined) {
@@ -81,12 +82,36 @@ function modrinthIdsFromUrl(url: string | undefined) {
 let counter = 0;
 const nextKey = (prefix: string) => `${prefix}-${(counter++).toString(36)}`;
 
-/** Racine commune d'une archive brute ("MonPack/mods/x.jar" -> "MonPack/"). */
+/** Dossiers qu'on trouve a la racine d'une instance Minecraft. */
+const INSTANCE_DIRS = [
+  "mods/", "config/", "resourcepacks/", "shaderpacks/", "datapacks/",
+  "defaultconfigs/", "kubejs/", "scripts/", "schematics/", "saves/", "journeymap/",
+];
+
+/**
+ * Racine commune d'une archive brute ("MonPack/mods/x.jar" -> "MonPack/").
+ *
+ * Reperee sur les dossiers d'instance et non sur les seuls jars : beaucoup
+ * d'archives partagees ne contiennent que des configurations, et il faut
+ * quand meme retirer leur dossier englobant, sinon tout atterrit une fois
+ * de trop imbrique.
+ */
 function commonPrefix(paths: string[]): string {
   if (!paths.length) return "";
-  const idx = paths[0].indexOf("mods/");
-  const candidate = idx > 0 ? paths[0].slice(0, idx) : "";
-  return paths.every((p) => p.startsWith(candidate)) ? candidate : "";
+  const candidates = new Set<string>();
+  for (const p of paths) {
+    for (const dir of INSTANCE_DIRS) {
+      const i = p.indexOf(dir);
+      if (i > 0 && (i === 0 || p[i - 1] === "/")) candidates.add(p.slice(0, i));
+    }
+  }
+  // Le prefixe le plus court qui couvre toute l'archive : un prefixe plus
+  // long retirerait un dossier qui fait partie du contenu.
+  return (
+    [...candidates]
+      .sort((a, b) => a.length - b.length)
+      .find((c) => paths.every((p) => p.startsWith(c))) ?? ""
+  );
 }
 
 export interface ParseOptions {
@@ -120,6 +145,10 @@ export async function parsePack(
   else if (format === "curseforge") await parseCurseforge(entries, pack, warnings);
   else await parseRaw(entries, pack, warnings);
 
+  // La racine se lit sur l'archive complete : les relectures suivantes
+  // sautent les jars pour economiser la memoire et ne pourraient plus la
+  // deduire.
+  pack.rootPrefix = format === "raw" ? commonPrefix(Object.keys(entries)) : "";
   pack.overridePaths = Object.keys(extractOverrides(entries, pack));
 
   if (!pack.loader) {
@@ -143,13 +172,14 @@ async function parseMrpack(entries: ZipEntries, pack: ParsedPack, warnings: stri
   Object.assign(pack, loaderFromMrDependencies(index.dependencies ?? {}));
 
   for (const f of index.files) {
-    const kind = classifyPath(f.path);
+    const entry = classifyEntry(f.path);
     const { projectId, versionId } = modrinthIdsFromUrl(f.downloads?.[0]);
     const fileName = f.path.split("/").pop() ?? f.path;
 
     const mod: PackMod = {
       key: nextKey(pack.label),
       name: nameFromFileName(fileName),
+      kind: entry === "override" ? "mod" : entry,
       provider: projectId ? "modrinth" : "unknown",
       projectId,
       fileId: versionId,
@@ -163,7 +193,9 @@ async function parseMrpack(entries: ZipEntries, pack: ParsedPack, warnings: stri
       from: { kind: "pack", packId: pack.id },
     };
 
-    if (kind === "extra") pack.extraDownloads.push(mod);
+    // Les resource packs, shaders et datapacks du manifeste sont du contenu a
+    // part entiere : ils doivent etre resolus et exportes comme les mods.
+    if (entry === "override") pack.extraDownloads.push(mod);
     else pack.mods.push(mod);
   }
 
@@ -198,14 +230,17 @@ async function parseCurseforge(entries: ZipEntries, pack: ParsedPack, warnings: 
 
   for (const f of manifest.files) {
     const v = byFileId.get(String(f.fileID));
+    const cfName = v?.fileName ?? `${f.projectID}-${f.fileID}.jar`;
+    const cfKind: ContentKind = cfName.toLowerCase().endsWith(".jar") ? "mod" : "resourcepack";
     pack.mods.push({
       key: nextKey(pack.label),
       name: v ? nameFromFileName(v.fileName) : `Projet CurseForge ${f.projectID}`,
+      kind: cfKind,
       provider: "curseforge",
       projectId: String(f.projectID),
       fileId: String(f.fileID),
       versionNumber: v?.versionNumber,
-      path: `mods/${v?.fileName ?? `${f.projectID}-${f.fileID}.jar`}`,
+      path: `${CONTENT_INFO[cfKind].folder}/${cfName}`,
       fileName: v?.fileName ?? `${f.projectID}-${f.fileID}.jar`,
       fileSize: v?.fileSize,
       hashes: { sha1: v?.hashes.sha1 },
@@ -226,7 +261,7 @@ async function parseRaw(entries: ZipEntries, pack: ParsedPack, warnings: string[
     return;
   }
 
-  const prefix = commonPrefix(jarPaths.filter((p) => p.includes("mods/")));
+  const prefix = commonPrefix(Object.keys(entries));
   const sha1s: string[] = [];
   const fingerprints: number[] = [];
   const staged: { mod: PackMod; fp: number }[] = [];
@@ -245,6 +280,7 @@ async function parseRaw(entries: ZipEntries, pack: ParsedPack, warnings: string[
       mod: {
         key: nextKey(pack.label),
         name: meta?.name ?? nameFromFileName(fileName),
+        kind: "mod",
         provider: "unknown",
         versionNumber: meta?.version,
         path: rel.startsWith("mods/") ? rel : `mods/${fileName}`,
@@ -299,7 +335,7 @@ async function parseRaw(entries: ZipEntries, pack: ParsedPack, warnings: string[
  */
 export function extractOverrides(
   entries: ZipEntries,
-  pack: Pick<ParsedPack, "format">,
+  pack: Pick<ParsedPack, "format"> & Partial<Pick<ParsedPack, "rootPrefix">>,
 ): Record<string, Uint8Array> {
   // Prototype nul : les clefs sont des chemins issus de l'archive.
   const out: Record<string, Uint8Array> = Object.create(null);
@@ -324,8 +360,7 @@ export function extractOverrides(
     return out;
   }
 
-  const jarPaths = Object.keys(entries).filter((p) => /\.jar$/i.test(p));
-  const prefix = commonPrefix(jarPaths.filter((p) => p.includes("mods/")));
+  const prefix = pack.rootPrefix ?? commonPrefix(Object.keys(entries));
   for (const [path, data] of Object.entries(entries)) {
     if (/^.*mods\/[^/]+\.jar$/i.test(path)) continue;
     const rel = path.slice(prefix.length);
@@ -345,6 +380,7 @@ async function enrichModrinth(mods: PackMod[]) {
       if (!p) continue;
       m.name = p.title;
       m.slug = p.slug;
+      m.kind = p.kind;
       if (m.env.client === "unknown") m.env.client = p.clientSide ?? "unknown";
       if (m.env.server === "unknown") m.env.server = p.serverSide ?? "unknown";
     }
@@ -363,6 +399,7 @@ async function enrichCurseforge(mods: PackMod[]) {
       if (p) {
         m.name = p.title;
         m.slug = p.slug;
+        m.kind = p.kind;
       }
     }
   } catch {

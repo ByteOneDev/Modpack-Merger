@@ -1,4 +1,10 @@
 import { request, chunk } from "./http";
+import {
+  kindFromModrinthType,
+  providerLoaders,
+  CONTENT_INFO,
+  type ContentKind,
+} from "@/lib/core/content";
 import type {
   EnvSupport,
   ProviderDependency,
@@ -37,6 +43,7 @@ interface MrVersion {
 interface MrProject {
   id: string;
   slug: string;
+  project_type?: string;
   title: string;
   description: string;
   downloads: number;
@@ -53,6 +60,7 @@ interface MrProject {
 interface MrHit {
   project_id: string;
   slug: string;
+  project_type?: string;
   title: string;
   description: string;
   downloads: number;
@@ -98,6 +106,7 @@ function toProject(p: MrProject): ProviderProject {
   return {
     provider: "modrinth",
     projectId: p.id,
+    kind: kindFromModrinthType(p.project_type, p.loaders ?? []),
     slug: p.slug,
     title: p.title,
     description: p.description,
@@ -110,8 +119,20 @@ function toProject(p: MrProject): ProviderProject {
     dateModified: p.updated,
     clientSide: p.client_side,
     serverSide: p.server_side,
-    url: `https://modrinth.com/mod/${p.slug}`,
+    // Modrinth redirige /mod/<slug> vers le bon type, mais donner directement
+    // le bon segment evite une redirection et un lien trompeur.
+    url: `https://modrinth.com/${urlSegment(kindFromModrinthType(p.project_type, p.loaders ?? []))}/${p.slug}`,
+    // Modrinth impose la distribution libre : un projet publie y est toujours
+    // telechargeable par un tiers.
+    allowDistribution: true,
   };
+}
+
+function urlSegment(kind: ContentKind): string {
+  return kind === "resourcepack" ? "resourcepack"
+    : kind === "shaderpack" ? "shader"
+    : kind === "datapack" ? "datapack"
+    : "mod";
 }
 
 export const modrinth = {
@@ -142,11 +163,11 @@ export const modrinth = {
     idOrSlug: string,
     loaders: string[],
     gameVersions: string[],
+    kind: ContentKind = "mod",
   ): Promise<ProviderVersion[]> {
-    const qs = new URLSearchParams({
-      loaders: JSON.stringify(loaders),
-      game_versions: JSON.stringify(gameVersions),
-    });
+    const wanted = providerLoaders(kind, loaders);
+    const qs = new URLSearchParams({ game_versions: JSON.stringify(gameVersions) });
+    if (wanted.length) qs.set("loaders", JSON.stringify(wanted));
     const res = await request<MrVersion[]>(
       `${API}/project/${idOrSlug}/version?${qs}`,
       { provider: P, nullOn404: true },
@@ -180,9 +201,16 @@ export const modrinth = {
     loaders: string[],
     gameVersion: string,
     limit = 20,
+    kind: ContentKind = "mod",
   ): Promise<ProviderProject[]> {
-    const facets: string[][] = [["project_type:mod"]];
-    if (loaders.length) facets.push(loaders.map((l) => `categories:${l}`));
+    const type = CONTENT_INFO[kind].modrinthType;
+    if (!type) return []; // les schematiques ne sont pas un type Modrinth
+
+    const facets: string[][] = [[`project_type:${type}`]];
+    // Un resource pack n'est pas publie sous "fabric" : filtrer par le loader
+    // du pack ne renverrait rien du tout.
+    const wanted = providerLoaders(kind, loaders);
+    if (kind === "mod" && wanted.length) facets.push(wanted.map((l) => `categories:${l}`));
     if (gameVersion) facets.push([`versions:${gameVersion}`]);
 
     const qs = new URLSearchParams({
@@ -197,6 +225,7 @@ export const modrinth = {
     return (res?.hits ?? []).map((h) => ({
       provider: "modrinth" as const,
       projectId: h.project_id,
+      kind: kindFromModrinthType(h.project_type, h.categories ?? []),
       slug: h.slug,
       title: h.title,
       description: h.description,
@@ -209,7 +238,8 @@ export const modrinth = {
       dateModified: h.date_modified,
       clientSide: h.client_side,
       serverSide: h.server_side,
-      url: `https://modrinth.com/mod/${h.slug}`,
+      url: `https://modrinth.com/${urlSegment(kindFromModrinthType(h.project_type, h.categories ?? []))}/${h.slug}`,
+      allowDistribution: true,
     }));
   },
 

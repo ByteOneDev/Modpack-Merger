@@ -1,7 +1,7 @@
 "use client";
 
 import { providerOf } from "@/lib/core/providers";
-import { pickBestVersion } from "@/lib/core/merge/resolve";
+import { newerThanPicked, pickBestVersion } from "@/lib/core/merge/resolve";
 import { resolveDependencies } from "@/lib/core/merge/deps";
 import { detectFunctionalConflicts } from "@/lib/core/merge/functional";
 import { estimateRam } from "@/lib/core/merge/ram";
@@ -12,9 +12,23 @@ import {
   type ModResolution,
   type PackMod,
   type ProviderId,
+  type ProviderVersion,
 } from "@/lib/core/types";
+import { sha1 } from "@/lib/core/hash";
+import { storeManualFile } from "@/lib/manual";
 import type { MergeState } from "@/lib/store";
 import type { Settings } from "@/lib/settings";
+import { CONTENT_INFO, type ContentKind } from "@/lib/core/content";
+
+/**
+ * Cote par defaut quand la source ne le precise pas. Un shader ne sert a rien
+ * sur un serveur, un datapack ne sert a rien sans monde a charger.
+ */
+function defaultEnv(kind: ContentKind, side: "client" | "server") {
+  const declared = CONTENT_INFO[kind].side;
+  if (declared === "both") return "unknown" as const;
+  return declared === side ? ("required" as const) : ("unsupported" as const);
+}
 
 /**
  * Actions de l'etape "Mods". Tout se passe en memoire : il n'y a pas de
@@ -205,6 +219,7 @@ export async function addMod(
   provider: ProviderId,
   projectId: string,
   settings: Settings,
+  kind: ContentKind = "mod",
 ): Promise<Partial<MergeState> & { error?: string; addedName?: string; addedDeps?: number }> {
   const target: MergeTarget | null = state.target;
   if (!target) return { error: "Lance d'abord l'analyse." };
@@ -219,14 +234,20 @@ export async function addMod(
 
   const api = providerOf(provider);
   const [versions, project] = await Promise.all([
-    api.getVersions(projectId, LOADER_COMPAT[target.loader], [target.minecraft]).catch(() => []),
+    api
+      .getVersions(projectId, LOADER_COMPAT[target.loader], [target.minecraft], kind)
+      .catch(() => []),
     api.getProject(projectId).catch(() => null),
   ]);
 
-  const picked = pickBestVersion(versions, target, settings.preferStable);
+  const picked = pickBestVersion(versions, target, settings.preferStable, kind);
   if (!picked) {
+    const what = CONTENT_INFO[kind].label;
     return {
-      error: `${project?.title ?? "Ce mod"} n'a pas de version pour ${target.loader} ${target.minecraft}.`,
+      error:
+        kind === "mod"
+          ? `${project?.title ?? "Ce mod"} n'a pas de version pour ${target.loader} ${target.minecraft}.`
+          : `${project?.title ?? `Ce ${what}`} n'a pas de version pour Minecraft ${target.minecraft}.`,
     };
   }
 
@@ -234,32 +255,47 @@ export async function addMod(
   const source: PackMod = {
     key: `manual-${provider}-${projectId}`,
     name,
+    kind,
     slug: project?.slug,
     provider,
     projectId,
-    path: `mods/${picked.fileName}`,
+    path: `${CONTENT_INFO[kind].folder}/${picked.fileName}`,
     fileName: picked.fileName,
     fileSize: picked.fileSize,
     hashes: picked.hashes,
     downloads: picked.downloadUrl ? [picked.downloadUrl] : [],
     env: {
-      client: project?.clientSide ?? "unknown",
-      server: project?.serverSide ?? "unknown",
+      client: project?.clientSide ?? defaultEnv(kind, "client"),
+      server: project?.serverSide ?? defaultEnv(kind, "server"),
     },
     required: true,
     from: { kind: "manual" },
   };
 
+  // Meme signalement que pour les mods issus des packs : si une version plus
+  // recente existe mais n'est pas stable, il faut pouvoir le voir.
+  const newer = newerThanPicked(picked, versions, target, kind);
+
   const added: ModResolution = {
     key: source.key,
     name,
+    kind,
     from: { kind: "manual" },
     status: "ok",
     source,
     picked,
     project: project ?? undefined,
     unstable: picked.versionType !== "release",
-    reason: `Ajoute a la main — ${picked.versionNumber} (${picked.versionType})`,
+    newerAvailable: newer
+      ? {
+          versionNumber: newer.versionNumber,
+          versionType: newer.versionType,
+          datePublished: newer.datePublished,
+        }
+      : undefined,
+    reason:
+      `Ajoute a la main — ${picked.versionNumber} (${picked.versionType})` +
+      (newer ? ` — ${newer.versionNumber} est plus recente mais en ${newer.versionType}` : ""),
   };
 
   const resolutions = [...state.resolutions, added];
@@ -274,6 +310,72 @@ export async function addMod(
   }
 
   return { ...withDerived(state, full, settings), addedName: name, addedDeps: depCount };
+}
+
+/**
+ * Ajoute des schematiques fournies par l'utilisateur.
+ *
+ * Il n'y a pas de projet a resoudre : le fichier est deja la. On lui fabrique
+ * une resolution pour qu'il suive le meme chemin que le reste jusqu'a
+ * l'archive, et les octets sont ranges avec les autres fichiers manuels.
+ */
+export async function addSchematics(
+  state: MergeState,
+  files: { name: string; size: number; bytes: Uint8Array }[],
+  settings: Settings,
+): Promise<Partial<MergeState> & { addedCount: number }> {
+  const manualFiles = { ...state.manualFiles };
+  const added: ModResolution[] = [];
+
+  for (const file of files) {
+    const digest = sha1(file.bytes);
+    const key = `schematic-${digest.slice(0, 16)}`;
+    if (state.resolutions.some((r) => r.key === key)) continue;
+
+    await storeManualFile(key, file.bytes);
+    manualFiles[key] = {
+      fileName: file.name,
+      size: file.size,
+      sha1: digest,
+      verified: true,
+    };
+
+    const picked: ProviderVersion = {
+      provider: "modrinth", // valeur de forme : rien n'est interroge en ligne
+      projectId: key,
+      versionId: digest,
+      name: file.name,
+      versionNumber: "fichier local",
+      versionType: "release",
+      datePublished: new Date().toISOString(),
+      loaders: [],
+      gameVersions: state.target ? [state.target.minecraft] : [],
+      fileName: file.name,
+      fileSize: file.size,
+      downloadUrl: null,
+      hashes: { sha1: digest },
+      dependencies: [],
+      local: true,
+    };
+
+    added.push({
+      key,
+      name: file.name.replace(/\.[a-z0-9]+$/i, ""),
+      kind: "schematic",
+      from: { kind: "manual" },
+      status: "ok",
+      picked,
+      reason: `Schematique fournie a la main — ${file.name}`,
+    });
+  }
+
+  if (!added.length) return { addedCount: 0 };
+
+  return {
+    ...withDerived(state, [...state.resolutions, ...added], settings),
+    manualFiles,
+    addedCount: added.length,
+  };
 }
 
 /** Garde un seul mod d'un groupe en conflit et ecarte les autres. */

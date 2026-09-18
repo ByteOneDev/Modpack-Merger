@@ -1,6 +1,7 @@
 import { modrinth } from "./modrinth";
 import { curseforge } from "./curseforge";
 import type { ProviderId, ProviderProject, ProviderVersion } from "@/lib/core/types";
+import { CONTENT_INFO, type ContentKind } from "@/lib/core/content";
 
 export { modrinth, curseforge };
 
@@ -20,10 +21,14 @@ export async function searchAll(
   loaders: string[],
   gameVersion: string,
   limit = 20,
+  kind: ContentKind = "mod",
 ): Promise<ProviderProject[]> {
+  const info = CONTENT_INFO[kind];
+  if (!info.modrinthType && info.curseforgeClass === null) return [];
+
   const results = await Promise.allSettled(
     activeProviders().map((p) =>
-      providerOf(p).search(query, loaders, gameVersion, limit),
+      providerOf(p).search(query, loaders, gameVersion, limit, kind),
     ),
   );
   const flat = results.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
@@ -47,8 +52,9 @@ export async function versionsFor(
   projectId: string,
   loaders: string[],
   gameVersions: string[],
+  kind: ContentKind = "mod",
 ): Promise<ProviderVersion[]> {
-  return providerOf(provider).getVersions(projectId, loaders, gameVersions);
+  return providerOf(provider).getVersions(projectId, loaders, gameVersions, kind);
 }
 
 export function normalizeTitle(title: string): string {

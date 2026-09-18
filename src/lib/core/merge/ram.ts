@@ -64,8 +64,17 @@ export function estimateRam(
   minecraft: string,
   opts: { hasShaders?: boolean; hasResourcePacks?: boolean } = {},
 ): RamEstimate {
-  const kept = resolutions.filter((r) => r.status === "ok" || r.status === "substituted");
+  const all = resolutions.filter((r) => r.status === "ok" || r.status === "substituted");
+  // Seuls les mods sont charges par la JVM. Un resource pack pese sur la
+  // memoire video, un datapack sur le serveur, une schematique sur rien du
+  // tout : les compter comme des mods gonflerait l'estimation pour rien.
+  const kept = all.filter((r) => r.kind === "mod");
   const count = kept.length;
+
+  // Le contenu ajoute au pack compte au meme titre que celui trouve dans les
+  // archives : un shader reste un shader d'ou qu'il vienne.
+  const hasShaders = opts.hasShaders || all.some((r) => r.kind === "shaderpack");
+  const hasResourcePacks = opts.hasResourcePacks || all.some((r) => r.kind === "resourcepack");
 
   const breakdown: RamEstimate["breakdown"] = [];
   const notes: string[] = [];
@@ -155,7 +164,7 @@ export function estimateRam(
   }
 
   let clientExtra = 0;
-  if (opts.hasShaders) {
+  if (hasShaders) {
     clientExtra += 1.5;
     breakdown.push({
       label: "Shaders inclus",
@@ -163,7 +172,7 @@ export function estimateRam(
       detail: "buffers graphiques supplementaires, cote client uniquement",
     });
   }
-  if (opts.hasResourcePacks) {
+  if (hasResourcePacks) {
     clientExtra += 0.5;
     breakdown.push({
       label: "Packs de ressources",

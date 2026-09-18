@@ -1,9 +1,11 @@
-import { writeZip, toU8, type ZipEntries } from "./zip";
+import { ZipStream, isPrecompressed, toU8, type ZipSink } from "./zip";
 import { bytesEqual } from "./hash";
 import { latestLoaderVersion, MRPACK_LOADER_KEY } from "./loaderversions";
 import { applyDecision, type OverrideSide, type PackFiles } from "./merge/overrides";
 import { estimateRam } from "./merge/ram";
 import { getProviderConfig } from "./providers/config";
+import { CONTENT_INFO, SCHEMATIC_MODS, type ContentKind } from "./content";
+import { buildSummary, type PackSummary, type SummaryItem } from "./summary";
 import type {
   MergeTarget,
   ModResolution,
@@ -12,6 +14,29 @@ import type {
 } from "./types";
 
 export type ExportFormat = "mrpack" | "curseforge";
+
+/**
+ * Dossier de destination d'un contenu.
+ *
+ * Les schematiques sont le seul cas ou le dossier depend du pack lui-meme :
+ * Litematica lit schematics/, WorldEdit config/worldedit/schematics/. Poser
+ * un fichier au mauvais endroit revient a ne pas le livrer.
+ */
+export function folderFor(kind: ContentKind, schematicFolder = "schematics"): string {
+  return kind === "schematic" ? schematicFolder : CONTENT_INFO[kind].folder;
+}
+
+/** Dossier a schematiques impose par les mods presents dans le pack. */
+export function detectSchematicFolder(resolutions: ModResolution[]): string {
+  for (const r of resolutions) {
+    if (r.status !== "ok" && r.status !== "substituted") continue;
+    const hit =
+      SCHEMATIC_MODS[(r.project?.slug ?? "").toLowerCase()] ??
+      SCHEMATIC_MODS[(r.source?.slug ?? "").toLowerCase()];
+    if (hit) return hit.folder;
+  }
+  return "schematics";
+}
 
 export interface BuildOptions {
   target: MergeTarget;
@@ -23,6 +48,17 @@ export interface BuildOptions {
   bundleJars: boolean;
   concurrency?: number;
   ram?: RamEstimate;
+  /**
+   * Fichiers recuperes a la main par l'utilisateur, indexes par cle de
+   * resolution. Ils court-circuitent le telechargement automatique.
+   */
+  manualFiles?: Map<string, Uint8Array>;
+  /**
+   * Destination sur disque. Quand elle est fournie, l'archive n'est jamais
+   * detenue en entier : indispensable au-dela de ~2 Go, ou le stockage de
+   * Blobs du navigateur atteint lui aussi ses limites.
+   */
+  sink?: ZipSink;
   onProgress?: (step: string, done: number, total: number) => void;
 }
 
@@ -31,7 +67,9 @@ export interface BuildReport {
   modsIncluded: number;
   modsLinked: number;
   modsBundled: number;
-  modsFailed: { name: string; reason: string }[];
+  modsFailed: { name: string; reason: string; key: string; pageUrl?: string }[];
+  /** nombre de fichiers repris depuis un telechargement manuel */
+  modsFromManual: number;
   overridesWritten: number;
   overrideConflictsResolved: number;
   totalBytes: number;
@@ -112,35 +150,64 @@ async function download(url: string): Promise<Uint8Array | null> {
   }
 }
 
-async function downloadAll(
-  items: { key: string; url: string }[],
+interface BundleItem {
+  key: string;
+  name: string;
+  /** destination dans l'archive */
+  path: string;
+  url: string;
+  /** page ou recuperer le fichier a la main si le telechargement echoue */
+  pageUrl?: string;
+  /** message a afficher si le telechargement echoue */
+  failure: string;
+}
+
+/**
+ * Telecharge et remet chaque fichier au fur et a mesure.
+ *
+ * `onReady` est synchrone et appele depuis la continuation d'un await : il ne
+ * peut donc pas s'entrelacer avec un autre, ce qui garantit que les entrees
+ * arrivent une par une dans l'archive.
+ */
+async function downloadInto(
+  items: BundleItem[],
   concurrency: number,
+  onReady: (item: BundleItem, data: Uint8Array | null) => void,
   onProgress?: (done: number, total: number) => void,
-): Promise<Map<string, Uint8Array>> {
-  const out = new Map<string, Uint8Array>();
+  drain?: () => Promise<void>,
+): Promise<void> {
   let cursor = 0;
   let done = 0;
   const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
     for (;;) {
       const i = cursor++;
       if (i >= items.length) return;
-      const data = await download(items[i].url);
-      if (data) out.set(items[i].key, data);
+      const item = items[i];
+      const data = await download(item.url);
+      onReady(item, data);
+      await drain?.();
       onProgress?.(++done, items.length);
     }
   });
   await Promise.all(workers);
-  return out;
 }
 
 export async function buildPack(opts: BuildOptions): Promise<{
-  data: Uint8Array;
+  /** null quand l'archive a ete ecrite directement dans un fichier */
+  blob: Blob | null;
   report: BuildReport;
 }> {
   const { target, format, bundleJars } = opts;
   const warnings: string[] = [];
   const failed: BuildReport["modsFailed"] = [];
-  const entries: ZipEntries = {};
+
+  // Archive ecrite au fil de l'eau. Un pack complet de plusieurs centaines de
+  // mods pese plus que ce qu'un seul tableau d'octets peut contenir : tout
+  // assembler en memoire avant d'ecrire echouait sur "Array buffer allocation
+  // failed" des que le total approchait le Go.
+  const zip = new ZipStream(opts.sink);
+  const write = (path: string, data: Uint8Array) =>
+    zip.add(path, data, !isPrecompressed(path));
 
   const kept = opts.resolutions.filter(
     (r) => (r.status === "ok" || r.status === "substituted") && r.picked,
@@ -167,13 +234,13 @@ export async function buildPack(opts: BuildOptions): Promise<{
 
   for (const [path, sides] of byPath) {
     if (sides.length === 1 || sides.every((s) => bytesEqual(s.data, sides[0].data))) {
-      entries[outPath(path)] = sides[0].data;
+      write(outPath(path), sides[0].data);
       overridesWritten++;
       continue;
     }
     const decision = opts.decisions[path] ?? sides[0].packId;
     for (const file of applyDecision(path, sides, decision)) {
-      entries[outPath(file.path)] = file.data;
+      write(outPath(file.path), file.data);
       overridesWritten++;
     }
     conflictsResolved++;
@@ -191,9 +258,11 @@ export async function buildPack(opts: BuildOptions): Promise<{
 
   /* ---------------- mods ---------------- */
 
+  const schematicFolder = detectSchematicFolder(opts.resolutions);
   let linked = 0;
   let bundled = 0;
-  const toBundle: { key: string; url: string }[] = [];
+  let fromManual = 0;
+  const toBundle: BundleItem[] = [];
   const indexFiles: unknown[] = [];
   const cfFiles: { projectID: number; fileID: number; required: boolean }[] = [];
 
@@ -207,7 +276,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
     if (!bundleJars && nativeToFormat) {
       if (format === "mrpack") {
         indexFiles.push({
-          path: `mods/${v.fileName}`,
+          path: `${folderFor(r.kind, schematicFolder)}/${v.fileName}`,
           hashes: { sha1: v.hashes.sha1 ?? "", sha512: v.hashes.sha512 ?? "" },
           env: {
             client: envValue(r.project?.clientSide),
@@ -227,39 +296,61 @@ export async function buildPack(opts: BuildOptions): Promise<{
       continue;
     }
 
+    // Un fichier depose a la main l'emporte : c'est le seul recours pour les
+    // mods dont l'auteur a coupe la distribution par des tiers.
+    const manual = opts.manualFiles?.get(r.key);
+    if (manual) {
+      write(`overrides/${folderFor(r.kind, schematicFolder)}/${v.fileName}`, manual);
+      bundled++;
+      fromManual++;
+      continue;
+    }
+
     if (v.downloadUrl && isAllowedDownload(v.downloadUrl)) {
-      toBundle.push({ key: r.key, url: v.downloadUrl });
+      toBundle.push({
+        key: r.key,
+        name: r.name,
+        path: `overrides/${folderFor(r.kind, schematicFolder)}/${v.fileName}`,
+        url: v.downloadUrl,
+        pageUrl: v.pageUrl ?? r.project?.url,
+        failure:
+          "telechargement echoue (le navigateur peut aussi l'avoir bloque pour cause de CORS)",
+      });
     } else {
       failed.push({
+        key: r.key,
         name: r.name,
+        pageUrl: v.pageUrl ?? r.project?.url,
         reason: v.downloadUrl
           ? "lien de telechargement refuse : hote non autorise"
-          : "aucun lien de telechargement (distribution tierce desactivee par l'auteur)",
+          : "distribution tierce desactivee par l'auteur : a recuperer a la main",
       });
     }
   }
 
   if (toBundle.length) {
     opts.onProgress?.("Telechargement des mods", 0, toBundle.length);
-    const downloaded = await downloadAll(
+    // Chaque jar part dans l'archive des son arrivee, puis est relache : on
+    // ne detient jamais plus de `concurrency` fichiers a la fois.
+    await downloadInto(
       toBundle,
       opts.concurrency ?? 5,
+      (item, data) => {
+        if (!data) {
+          failed.push({
+            key: item.key,
+            name: item.name,
+            pageUrl: item.pageUrl,
+            reason: item.failure,
+          });
+          return;
+        }
+        write(item.path, data);
+        bundled++;
+      },
       (done, total) => opts.onProgress?.("Telechargement des mods", done, total),
+      () => zip.drain(),
     );
-    for (const r of kept) {
-      if (!toBundle.some((t) => t.key === r.key)) continue;
-      const data = downloaded.get(r.key);
-      if (!data) {
-        failed.push({
-          name: r.name,
-          reason:
-            "telechargement echoue (le navigateur peut aussi l'avoir bloque pour cause de CORS)",
-        });
-        continue;
-      }
-      entries[`overrides/mods/${r.picked!.fileName}`] = data;
-      bundled++;
-    }
   }
 
   /* ---------------- manifeste ---------------- */
@@ -286,7 +377,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
     const dependencies: Record<string, string> = { minecraft: target.minecraft };
     if (loaderVersion) dependencies[MRPACK_LOADER_KEY[target.loader]] = loaderVersion;
 
-    entries["modrinth.index.json"] = toU8(
+    write("modrinth.index.json", toU8(
       JSON.stringify(
         {
           formatVersion: 1,
@@ -300,10 +391,10 @@ export async function buildPack(opts: BuildOptions): Promise<{
         null,
         2,
       ),
-    );
+    ));
     fileName = `${safeName}-${target.version}.mrpack`;
   } else {
-    entries["manifest.json"] = toU8(
+    write("manifest.json", toU8(
       JSON.stringify(
         {
           minecraft: {
@@ -321,8 +412,8 @@ export async function buildPack(opts: BuildOptions): Promise<{
         null,
         2,
       ),
-    );
-    entries["modlist.html"] = toU8(buildModlistHtml(kept, target));
+    ));
+    write("modlist.html", toU8(buildModlistHtml(kept, target)));
     if (!cfFiles.length && bundled > 0) {
       warnings.push(
         "Aucun mod n'a pu etre reference par son identifiant CurseForge : ils sont tous " +
@@ -336,29 +427,42 @@ export async function buildPack(opts: BuildOptions): Promise<{
   const ram =
     opts.ram ?? estimateRam(opts.resolutions, target.minecraft);
 
-  entries["RAPPORT-DE-FUSION.md"] = toU8(
-    buildMarkdownReport(opts.resolutions, target, ram, {
-      linked,
-      bundled,
-      failed,
-      conflictsResolved,
-      packs: opts.packFiles.map((p) => p.label),
-    }),
+  write(
+    "RAPPORT-DE-FUSION.md",
+    toU8(
+      buildMarkdownReport(opts.resolutions, target, ram, {
+        linked,
+        bundled,
+        failed,
+        conflictsResolved,
+        packs: opts.packFiles.map((p) => p.label),
+      }),
+    ),
   );
 
-  const data = writeZip(entries, 6);
+  let blob: Blob | null;
+  try {
+    blob = await zip.finish();
+  } catch (err) {
+    // Un fichier a moitie ecrit ressemble a une archive valide : mieux vaut
+    // l'effacer que de laisser croire que l'export a reussi.
+    await zip.abort();
+    throw err;
+  }
+  const totalBytes = blob ? blob.size : zip.bytesWritten;
 
   return {
-    data,
+    blob,
     report: {
       fileName,
       modsIncluded: linked + bundled,
       modsLinked: linked,
       modsBundled: bundled,
+      modsFromManual: fromManual,
       modsFailed: failed,
       overridesWritten,
       overrideConflictsResolved: conflictsResolved,
-      totalBytes: data.length,
+      totalBytes,
       warnings,
     },
   };
@@ -382,6 +486,62 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"]/g, (c) =>
     c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;",
   );
+}
+
+/** Inventaire par type de contenu, puis repartition client / serveur. */
+function contentSections(sum: PackSummary): string[] {
+  const line = (i: SummaryItem) =>
+    `- **${i.name}** — ${i.versionNumber} · ${i.provider}` +
+    (i.origin === "dependency" ? " _(dépendance)_" : "") +
+    (i.origin === "manual" ? " _(ajouté à la main)_" : "") +
+    (i.unstable ? " ⚠️ non stable" : "") +
+    (i.manualOnly ? " 🔒 à récupérer à la main" : "") +
+    (i.requires.length ? `\n  - exige : ${i.requires.join(", ")}` : "");
+
+  const out: string[] = ["## Contenu du pack", ""];
+  for (const g of sum.groups) {
+    out.push(
+      `### ${g.label} (${g.items.length})`,
+      "",
+      `_${g.hint}_`,
+      "",
+      ...g.items.map(line),
+      "",
+    );
+  }
+
+  out.push(
+    "## Répartition client / serveur",
+    "",
+    `- **Client uniquement (${sum.clientOnly.length})** : ` +
+      (sum.clientOnly.map((i) => i.name).join(", ") || "aucun"),
+    "",
+    `- **Serveur uniquement (${sum.serverOnly.length})** : ` +
+      (sum.serverOnly.map((i) => i.name).join(", ") || "aucun"),
+    "",
+    `- **Les deux côtés (${sum.shared.length})**`,
+    "",
+    "Pour un serveur dédié, n'installer que « les deux côtés » et « serveur " +
+      "uniquement » : le reste est inutile et consomme de la mémoire pour rien.",
+    "",
+  );
+
+  if (sum.manualOnly.length) {
+    out.push(
+      `## À récupérer à la main (${sum.manualOnly.length})`,
+      "",
+      "Leur auteur interdit la distribution par des tiers. Ces fichiers se " +
+        "téléchargent depuis leur page, puis se déposent dans le dossier indiqué.",
+      "",
+      ...sum.manualOnly.map(
+        (i) => `- **${i.name}** ${i.versionNumber} → \`${CONTENT_INFO[i.kind].folder}/\`` +
+          (i.url ? ` — ${i.url}` : ""),
+      ),
+      "",
+    );
+  }
+
+  return out;
 }
 
 function buildMarkdownReport(
@@ -413,6 +573,7 @@ function buildMarkdownReport(
     `- Mods lies : ${stats.linked} · mods embarques : ${stats.bundled}`,
     `- Conflits de configuration arbitres : ${stats.conflictsResolved}`,
     "",
+    ...contentSections(buildSummary(resolutions)),
     "## Memoire recommandee",
     "",
     `- **Client : ${ram.clientGb} Go** (minimum fonctionnel : ${ram.minimumGb} Go)`,

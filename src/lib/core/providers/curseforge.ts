@@ -1,4 +1,9 @@
 import { request, chunk } from "./http";
+import {
+  kindFromCurseforgeClass,
+  CONTENT_INFO,
+  type ContentKind,
+} from "@/lib/core/content";
 import { getProviderConfig, effectiveCurseforgeBase } from "./config";
 import type {
   ProviderDependency,
@@ -18,7 +23,6 @@ import type {
 
 const P = "CurseForge";
 const GAME_ID = 432;
-const CLASS_MODS = 6;
 
 const LOADER_TYPE: Record<string, number> = {
   forge: 1,
@@ -56,6 +60,12 @@ interface CfMod {
   id: number;
   name: string;
   slug: string;
+  classId?: number;
+  /**
+   * false quand l'auteur a refuse la distribution par des tiers. L'API met
+   * alors downloadUrl a null sur tous ses fichiers.
+   */
+  allowModDistribution?: boolean;
   summary: string;
   downloadCount: number;
   thumbsUpCount?: number;
@@ -74,7 +84,7 @@ function cdnFallback(fileId: number, fileName: string): string {
   return `https://edge.forgecdn.net/files/${Math.floor(fileId / 1000)}/${fileId % 1000}/${encodeURIComponent(fileName)}`;
 }
 
-function toVersion(f: CfFile): ProviderVersion {
+function toVersion(f: CfFile, project?: { allow?: boolean; websiteUrl?: string }): ProviderVersion {
   const loaders = f.gameVersions
     .map((g) => g.toLowerCase())
     .filter((g) => LOADER_NAMES.has(g));
@@ -93,7 +103,12 @@ function toVersion(f: CfFile): ProviderVersion {
     gameVersions,
     fileName: f.fileName,
     fileSize: f.fileLength,
-    downloadUrl: f.downloadUrl ?? cdnFallback(f.id, f.fileName),
+    // Quand l'auteur a coupe la distribution tierce, on ne fabrique pas de
+    // lien CDN de contournement : son choix est respecte, et le fichier passe
+    // par le telechargement manuel.
+    downloadUrl: f.downloadUrl ?? (project?.allow === false ? null : cdnFallback(f.id, f.fileName)),
+    manualOnly: project?.allow === false,
+    pageUrl: project?.websiteUrl ? `${project.websiteUrl}/files/${f.id}` : undefined,
     hashes: { sha1: f.hashes?.find((h) => h.algo === 1)?.value?.toLowerCase() },
     dependencies: (f.dependencies ?? [])
       .map((d): ProviderDependency | null => {
@@ -119,9 +134,11 @@ function toProject(m: CfMod): ProviderProject {
         .filter(Boolean),
     ),
   ];
+  const kind = kindFromCurseforgeClass(m.classId);
   return {
     provider: "curseforge",
     projectId: String(m.id),
+    kind,
     slug: m.slug,
     title: m.name,
     description: m.summary,
@@ -132,9 +149,19 @@ function toProject(m: CfMod): ProviderProject {
     loaders,
     gameVersions: [...new Set((m.latestFilesIndexes ?? []).map((i) => i.gameVersion))],
     dateModified: m.dateModified,
-    url: m.links?.websiteUrl ?? `https://www.curseforge.com/minecraft/mc-mods/${m.slug}`,
+    url: m.links?.websiteUrl ?? `https://www.curseforge.com/minecraft/${CF_URL_SEGMENT[kind]}/${m.slug}`,
+    allowDistribution: m.allowModDistribution !== false,
   };
 }
+
+/** Segment d'URL du site CurseForge, par type de contenu. */
+const CF_URL_SEGMENT: Record<ContentKind, string> = {
+  mod: "mc-mods",
+  resourcepack: "texture-packs",
+  shaderpack: "shaders",
+  datapack: "data-packs",
+  schematic: "mc-mods",
+};
 
 async function cf<T>(
   path: string,
@@ -149,6 +176,36 @@ async function cf<T>(
     ...opts,
   });
   return res ? res.data : null;
+}
+
+/**
+ * Complete un lot de fichiers avec ce que seul le projet sait : l'auteur
+ * autorise-t-il la distribution, et quelle est l'adresse de sa page.
+ *
+ * L'endpoint /files ne porte pas ces informations. Sans elles on ne peut ni
+ * respecter un refus de distribution, ni proposer le telechargement manuel.
+ */
+async function withProjectInfo(files: CfFile[]): Promise<ProviderVersion[]> {
+  const modIds = [...new Set(files.map((f) => f.modId))];
+  const info = new Map<number, { allow?: boolean; websiteUrl?: string }>();
+  const remember = (m: CfMod) =>
+    info.set(m.id, { allow: m.allowModDistribution, websiteUrl: m.links?.websiteUrl });
+
+  if (modIds.length === 1) {
+    // Un seul projet : le GET partage son cache avec getProject, appele juste
+    // apres pour le meme mod. Le POST groupe a une autre clef de cache et
+    // couterait une requete de plus par mod resolu.
+    const m = await cf<CfMod>(`/v1/mods/${modIds[0]}`, { nullOn404: true }).catch(() => null);
+    if (m) remember(m);
+  } else {
+    for (const batch of chunk(modIds, 100)) {
+      const mods = await cf<CfMod[]>("/v1/mods", { method: "POST", body: { modIds: batch } })
+        .catch(() => null);
+      for (const m of mods ?? []) remember(m);
+    }
+  }
+
+  return files.map((f) => toVersion(f, info.get(f.modId)));
 }
 
 export const curseforge = {
@@ -192,22 +249,32 @@ export const curseforge = {
     id: string,
     loaders: string[],
     gameVersions: string[],
+    kind: ContentKind = "mod",
   ): Promise<ProviderVersion[]> {
     if (!base()) return [];
-    const results: ProviderVersion[] = [];
-    const types = loaders.map((l) => LOADER_TYPE[l]).filter((n): n is number => n !== undefined);
+    const raw: CfFile[] = [];
+    // Un resource pack ou un shader n'a pas de modLoaderType : filtrer par
+    // loader ne renverrait aucun fichier.
+    const types =
+      kind === "mod"
+        ? loaders.map((l) => LOADER_TYPE[l]).filter((n): n is number => n !== undefined)
+        : [];
 
     for (const gv of gameVersions.length ? gameVersions : [""]) {
       for (const lt of types.length ? types : [0]) {
-        const qs = new URLSearchParams({ pageSize: "50" });
+        // L'API renvoie les fichiers du plus recent au plus ancien : la
+        // premiere page contient donc toujours les dernieres publications.
+        const qs = new URLSearchParams({ pageSize: "50", index: "0" });
         if (gv) qs.set("gameVersion", gv);
         if (lt) qs.set("modLoaderType", String(lt));
         const files = await cf<CfFile[]>(`/v1/mods/${id}/files?${qs}`, { nullOn404: true });
-        if (files) results.push(...files.map(toVersion));
+        if (files) raw.push(...files);
       }
     }
-    const seen = new Set<string>();
-    return results.filter((v) => (seen.has(v.versionId) ? false : (seen.add(v.versionId), true)));
+
+    const seen = new Set<number>();
+    const unique = raw.filter((f) => (seen.has(f.id) ? false : (seen.add(f.id), true)));
+    return withProjectInfo(unique);
   },
 
   async getFiles(fileIds: string[]): Promise<ProviderVersion[]> {
@@ -218,7 +285,7 @@ export const curseforge = {
         method: "POST",
         body: { fileIds: batch.map(Number).filter(Number.isFinite) },
       });
-      if (res) out.push(...res.map(toVersion));
+      if (res) out.push(...(await withProjectInfo(res)));
     }
     return out;
   },
@@ -231,10 +298,12 @@ export const curseforge = {
         method: "POST",
         body: { fingerprints: batch },
       });
-      for (const m of res?.exactMatches ?? []) {
+      const hits = (res?.exactMatches ?? []).filter((m) => m.file);
+      const versions = await withProjectInfo(hits.map((m) => m.file));
+      hits.forEach((m, i) => {
         const fp = m.file?.fileFingerprint;
-        if (typeof fp === "number") map.set(fp, toVersion(m.file));
-      }
+        if (typeof fp === "number") map.set(fp, versions[i]);
+      });
     }
     return map;
   },
@@ -244,18 +313,22 @@ export const curseforge = {
     loaders: string[],
     gameVersion: string,
     limit = 20,
+    kind: ContentKind = "mod",
   ): Promise<ProviderProject[]> {
     if (!base()) return [];
+    const classId = CONTENT_INFO[kind].curseforgeClass;
+    if (classId === null) return []; // pas de categorie CurseForge pour ce type
+
     const qs = new URLSearchParams({
       gameId: String(GAME_ID),
-      classId: String(CLASS_MODS),
+      classId: String(classId),
       searchFilter: query,
       sortField: "2",
       sortOrder: "desc",
       pageSize: String(limit),
     });
     if (gameVersion) qs.set("gameVersion", gameVersion);
-    const lt = LOADER_TYPE[loaders[0] ?? ""];
+    const lt = kind === "mod" ? LOADER_TYPE[loaders[0] ?? ""] : undefined;
     if (lt) qs.set("modLoaderType", String(lt));
     const res = await cf<CfMod[]>(`/v1/mods/search?${qs}`);
     return (res ?? []).map(toProject);
