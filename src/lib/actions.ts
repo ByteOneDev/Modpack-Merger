@@ -72,6 +72,32 @@ export function excludeMod(
   return withDerived(state, resolutions, settings);
 }
 
+/**
+ * Ecarte plusieurs elements d'un coup.
+ *
+ * Sert de sortie assumee quand l'export est bloque : plutot qu'un
+ * contournement silencieux, l'utilisateur decide de se passer de ces
+ * elements, et le rapport de fusion le consigne.
+ */
+export function excludeMany(
+  state: MergeState,
+  keys: string[],
+  settings: Settings,
+  raison = "Ecarte volontairement : introuvable ou non telechargeable.",
+): Partial<MergeState> {
+  const cibles = new Set(keys);
+  const resolutions = state.resolutions.map((r) =>
+    cibles.has(r.key)
+      ? { ...r, status: "excluded" as const, picked: undefined, reason: raison }
+      : r,
+  );
+  return {
+    ...withDerived(state, resolutions, settings),
+    // Ces cles ne bloquent plus rien : elles ne font plus partie du pack.
+    failedDownloads: state.failedDownloads.filter((k) => !cibles.has(k)),
+  };
+}
+
 export function restoreMod(
   state: MergeState,
   key: string,

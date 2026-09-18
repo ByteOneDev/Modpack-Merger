@@ -59,6 +59,13 @@ export interface BuildOptions {
    * Blobs du navigateur atteint lui aussi ses limites.
    */
   sink?: ZipSink;
+  /**
+   * Refuse de produire l'archive si un fichier manque a l'appel.
+   *
+   * Un pack incomplet ne se voit pas : il s'installe, puis echoue plus tard.
+   * Mieux vaut ne rien livrer et dire ce qui manque.
+   */
+  requireComplete?: boolean;
   onProgress?: (step: string, done: number, total: number) => void;
 }
 
@@ -74,6 +81,18 @@ export interface BuildReport {
   overrideConflictsResolved: number;
   totalBytes: number;
   warnings: string[];
+}
+
+/** Levee quand requireComplete est actif et qu'un fichier manque. */
+export class IncompletePack extends Error {
+  constructor(readonly manquants: { name: string; reason: string; key: string }[]) {
+    super(
+      `${manquants.length} fichier(s) n'ont pas pu etre recuperes : ` +
+        manquants.slice(0, 5).map((m) => m.name).join(", ") +
+        (manquants.length > 5 ? `, et ${manquants.length - 5} autres` : ""),
+    );
+    this.name = "IncompletePack";
+  }
 }
 
 /** Domaines acceptes par les lanceurs pour les liens d'un .mrpack. */
@@ -124,30 +143,47 @@ export function isAllowedDownload(url: string): boolean {
   }
 }
 
-async function download(url: string): Promise<Uint8Array | null> {
-  if (!isAllowedDownload(url)) return null;
+/** Tentatives par fichier : une coupure reseau ne doit pas perdre un export. */
+const DOWNLOAD_ATTEMPTS = 3;
 
+async function downloadOnce(url: string): Promise<Uint8Array | null> {
   // Quand l'hebergement fournit un relais, on passe par lui : beaucoup de CDN
   // de mods n'envoient pas d'en-tetes CORS et refusent donc les requetes
   // venant directement d'une page web.
   const proxy = getProviderConfig().downloadProxyUrl;
   const target = proxy ? `${proxy}?url=${encodeURIComponent(url)}` : url;
 
-  try {
-    const res = await fetch(target, { signal: AbortSignal.timeout(120_000), redirect: "follow" });
-    if (!res.ok) return null;
-    // Sans relais, une redirection peut sortir de la liste blanche : on
-    // revalide l'arrivee. Avec relais, c'est lui qui a deja verifie chaque saut.
-    if (!proxy && res.url && !isAllowedDownload(res.url)) return null;
-    const len = Number(res.headers.get("content-length") ?? "0");
-    if (len > MAX_JAR_BYTES) return null;
-    const buf = new Uint8Array(await res.arrayBuffer());
-    // content-length peut mentir ou manquer : on verifie la taille reelle.
-    if (buf.length > MAX_JAR_BYTES) return null;
-    return buf;
-  } catch {
-    return null;
+  const res = await fetch(target, { signal: AbortSignal.timeout(120_000), redirect: "follow" });
+  if (!res.ok) return null;
+  // Sans relais, une redirection peut sortir de la liste blanche : on
+  // revalide l'arrivee. Avec relais, c'est lui qui a deja verifie chaque saut.
+  if (!proxy && res.url && !isAllowedDownload(res.url)) return null;
+  const len = Number(res.headers.get("content-length") ?? "0");
+  if (len > MAX_JAR_BYTES) return null;
+  const buf = new Uint8Array(await res.arrayBuffer());
+  // content-length peut mentir ou manquer : on verifie la taille reelle.
+  if (buf.length > MAX_JAR_BYTES) return null;
+  return buf;
+}
+
+async function download(url: string): Promise<Uint8Array | null> {
+  if (!isAllowedDownload(url)) return null;
+
+  for (let essai = 0; essai < DOWNLOAD_ATTEMPTS; essai++) {
+    try {
+      const data = await downloadOnce(url);
+      if (data) return data;
+    } catch {
+      /* coupure, delai depasse : on retente */
+    }
+    // Sur un pack de plusieurs centaines de mods, une poignee d'echecs
+    // passagers est normale ; les laisser tomber rendrait l'archive
+    // incomplete pour rien.
+    if (essai < DOWNLOAD_ATTEMPTS - 1) {
+      await new Promise((r) => setTimeout(r, 600 * (essai + 1)));
+    }
   }
+  return null;
 }
 
 interface BundleItem {
@@ -206,8 +242,16 @@ export async function buildPack(opts: BuildOptions): Promise<{
   // assembler en memoire avant d'ecrire echouait sur "Array buffer allocation
   // failed" des que le total approchait le Go.
   const zip = new ZipStream(opts.sink);
-  const write = (path: string, data: Uint8Array) =>
-    zip.add(path, data, !isPrecompressed(path));
+  const doublons: string[] = [];
+  const write = (path: string, data: Uint8Array) => {
+    const ecrit = zip.add(path, data, !isPrecompressed(path));
+    // Deux sources peuvent viser la meme destination : un fichier
+    // client-only et son equivalent commun replies ensemble pour le format
+    // CurseForge, ou un jar deja present dans overrides/mods. Le premier
+    // arrive gagne, et on le signale plutot que de l'ecrire deux fois.
+    if (!ecrit && !doublons.includes(path)) doublons.push(path);
+    return ecrit;
+  };
 
   const kept = opts.resolutions.filter(
     (r) => (r.status === "ok" || r.status === "substituted") && r.picked,
@@ -353,6 +397,13 @@ export async function buildPack(opts: BuildOptions): Promise<{
     );
   }
 
+  // Rien n'est livre si un morceau manque : l'archive serait installable et
+  // defectueuse, ce qui est pire qu'une generation refusee.
+  if (opts.requireComplete && failed.length) {
+    await zip.abort();
+    throw new IncompletePack(failed.map((f) => ({ ...f })));
+  }
+
   /* ---------------- manifeste ---------------- */
 
   opts.onProgress?.("Generation de l'archive", 0, 1);
@@ -439,6 +490,15 @@ export async function buildPack(opts: BuildOptions): Promise<{
       }),
     ),
   );
+
+  if (doublons.length) {
+    warnings.push(
+      `${doublons.length} fichier(s) visaient une destination deja occupee et ont ete ignores : ` +
+        doublons.slice(0, 3).join(", ") +
+        (doublons.length > 3 ? `, et ${doublons.length - 3} autres` : "") +
+        ". La premiere version rencontree a ete conservee.",
+    );
+  }
 
   let blob: Blob | null;
   try {

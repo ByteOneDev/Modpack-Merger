@@ -294,6 +294,49 @@ export async function resolveMod(
   };
 }
 
+/**
+ * Complete le cote client/serveur manquant, via Modrinth.
+ *
+ * L'API CurseForge ne dit nulle part si un mod sert au client, au serveur ou
+ * aux deux : sans cela, un pack entierement CurseForge repond "tout des deux
+ * cotes", ce qui ne renseigne personne. Beaucoup de ces mods sont aussi
+ * publies sur Modrinth, qui le declare — et le meme fichier s'y retrouve par
+ * son empreinte sha1.
+ *
+ * Deux requetes pour tout le pack, quel que soit le nombre de mods.
+ */
+export async function enrichEnvironments(resolutions: ModResolution[]): Promise<void> {
+  const inconnus = resolutions.filter(
+    (r) =>
+      (r.status === "ok" || r.status === "substituted") &&
+      r.picked?.hashes.sha1 &&
+      r.project?.clientSide === undefined &&
+      r.project?.serverSide === undefined,
+  );
+  if (!inconnus.length) return;
+
+  const parHash = await modrinth
+    .lookupByHashes(inconnus.map((r) => r.picked!.hashes.sha1!))
+    .catch(() => new Map<string, ProviderVersion>());
+  if (!parHash.size) return;
+
+  const projets = await modrinth
+    .getProjects([...new Set([...parHash.values()].map((v) => v.projectId))])
+    .catch(() => []);
+  const parProjet = new Map(projets.map((p) => [p.projectId, p]));
+
+  for (const r of inconnus) {
+    const v = parHash.get(r.picked!.hashes.sha1!.toLowerCase());
+    const p = v ? parProjet.get(v.projectId) : undefined;
+    if (!p) continue;
+    // Seul l'environnement est repris : le projet reste celui de sa source,
+    // avec son lien et son identifiant d'origine.
+    r.project = r.project
+      ? { ...r.project, clientSide: p.clientSide, serverSide: p.serverSide }
+      : p;
+  }
+}
+
 export async function resolveAll(
   groups: DedupedMod[],
   target: MergeTarget,
@@ -320,5 +363,6 @@ export async function resolveAll(
     out.push(...settled);
     opts.onProgress?.(Math.min(i + BATCH, groups.length), groups.length);
   }
+  await enrichEnvironments(out).catch(() => {});
   return out;
 }

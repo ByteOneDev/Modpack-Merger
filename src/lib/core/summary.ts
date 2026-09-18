@@ -117,7 +117,9 @@ export function buildSummary(resolutions: ModResolution[]): PackSummary {
       // afficher "modrinth" serait faux.
       provider: v.local ? "fichier local" : v.provider,
       fileSize: v.fileSize ?? 0,
-      url: r.project?.url,
+      // Page du fichier exact quand on l'a : c'est celle qui permet de le
+      // telecharger, la page du projet oblige a rechercher la bonne version.
+      url: v.pageUrl ?? r.project?.url,
       unstable: r.unstable ?? false,
       origin: originOf(r),
       requires: v.dependencies

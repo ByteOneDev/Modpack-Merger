@@ -2,7 +2,7 @@
 
 import { readZip } from "@/lib/core/zip";
 import { extractOverrides } from "@/lib/core/parse";
-import { dedupe, resolveAll } from "@/lib/core/merge/resolve";
+import { dedupe, enrichEnvironments, resolveAll } from "@/lib/core/merge/resolve";
 import { resolveDependencies } from "@/lib/core/merge/deps";
 import { detectFunctionalConflicts } from "@/lib/core/merge/functional";
 import { computeOverrideConflicts, type PackFiles } from "@/lib/core/merge/overrides";
@@ -67,6 +67,9 @@ export async function runAnalysis(
     onProgress({ phase: "Resolution des dependances", done: 0, total: 1 });
     const additions = await resolveDependencies(resolutions, target);
     withDeps = [...resolutions, ...additions.map((a) => a.resolution)];
+    // Les dependances viennent d'arriver : elles n'ont pas encore leur cote
+    // client/serveur si elles sortent de CurseForge.
+    await enrichEnvironments(withDeps).catch(() => {});
     onProgress({ phase: "Resolution des dependances", done: 1, total: 1 });
   }
 

@@ -1,6 +1,4 @@
-import {
-  unzipSync, zipSync, strFromU8, strToU8, Zip, ZipDeflate, ZipPassThrough,
-} from "fflate";
+import { unzipSync, deflateSync, strFromU8, strToU8 } from "fflate";
 
 export type ZipEntries = Record<string, Uint8Array>;
 
@@ -171,29 +169,9 @@ export function readZip(buf: Uint8Array, keep?: (path: string) => boolean): ZipE
   return out;
 }
 
-export function writeZip(entries: ZipEntries, level: 0 | 6 | 9 = 6): Uint8Array {
-  const safe: ZipEntries = {};
-  for (const [name, data] of Object.entries(entries)) {
-    const clean = normalizePath(name);
-    if (isSafePath(clean)) safe[clean] = data;
-  }
-  return zipSync(safe, { level });
-}
-
 /* ------------------------------------------------------------------ */
 /* Ecriture en flux                                                     */
 /* ------------------------------------------------------------------ */
-
-/**
- * Au-dela de ~32 Mo accumules, les morceaux sont replies dans un Blob.
- *
- * Un Blob n'occupe pas le tas JavaScript : le navigateur est libre de le
- * garder sur disque. C'est ce qui permet de produire une archive de plusieurs
- * Go la ou un unique Uint8Array echouerait sur "Array buffer allocation
- * failed" — la memoire contigue adressable par un onglet est bornee, quelle
- * que soit la RAM de la machine.
- */
-const FLUSH_BYTES = 32 * 1024 * 1024;
 
 /**
  * Destination d'ecriture directe, quand le navigateur en propose une.
@@ -209,50 +187,102 @@ export interface ZipSink {
 }
 
 /**
+ * Au-dela de ~32 Mo accumules, les morceaux sont replies dans un Blob.
+ *
+ * Un Blob n'occupe pas le tas JavaScript : le navigateur est libre de le
+ * garder sur disque. C'est ce qui permet de produire une archive de plusieurs
+ * Go la ou un unique Uint8Array echouerait sur "Array buffer allocation
+ * failed" — la memoire contigue adressable par un onglet est bornee, quelle
+ * que soit la RAM de la machine.
+ */
+const FLUSH_BYTES = 32 * 1024 * 1024;
+
+/** Seuil au-dela duquel les champs 32 bits du format ne suffisent plus. */
+const U32_MAX = 0xffffffff;
+
+const CRC_TABLE = /* @__PURE__ */ (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(data: Uint8Array): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < data.length; i++) c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/** Date et heure au format MS-DOS, seul format que porte un en-tete zip. */
+function dosDateTime(d: Date): { date: number; time: number } {
+  const annee = Math.max(1980, d.getFullYear());
+  return {
+    date: (((annee - 1980) & 0x7f) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+    time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+  };
+}
+
+interface EntryRecord {
+  name: Uint8Array;
+  crc: number;
+  compressed: number;
+  uncompressed: number;
+  method: number;
+  offset: number;
+  date: number;
+  time: number;
+}
+
+/**
  * Archive construite fichier par fichier.
  *
- * Contrairement a writeZip, rien n'est conserve en entier : chaque entree est
- * poussee puis relachee. Un pack complet de 400 mods represente facilement
- * 1,5 Go, soit bien au-dela de ce qu'un seul tableau d'octets peut couvrir.
+ * Ecrite a la main plutot qu'avec le writer en flux de fflate, pour deux
+ * raisons de compatibilite :
+ *
+ * 1. fflate ne connait pas la longueur d'une entree au moment d'ecrire son
+ *    en-tete local : il laisse donc CRC et tailles a zero et pose le drapeau
+ *    « descripteur de donnees ». C'est legal, mais c'est la variante du format
+ *    la plus mal supportee — QuaZip, qu'utilise Prism Launcher, echoue dessus.
+ *    Ici chaque entree est poussee entiere, donc CRC et tailles sont connus
+ *    avant l'en-tete : on les y ecrit, et aucun descripteur n'est necessaire.
+ * 2. fflate n'ecrit pas les enregistrements Zip64, ce qui plafonne une archive
+ *    a 4 Go — un pack complet de plusieurs centaines de mods les depasse.
+ *
+ * Rien n'est conserve en entier : chaque entree est ecrite puis relachee.
  */
 export class ZipStream {
-  private readonly zip: Zip;
+  private readonly entries: EntryRecord[] = [];
+  /**
+   * Chemins deja ecrits. Une archive qui contient deux fois la meme
+   * destination est acceptee par certains outils et refusee par d'autres :
+   * autant ne jamais en produire.
+   */
+  private readonly seen = new Set<string>();
   private parts: BlobPart[] = [];
   private buffered: Uint8Array[] = [];
   private bufferedBytes = 0;
   private written = 0;
   private failure: Error | null = null;
-  private finished = false;
-  private onFinished: (() => void) | null = null;
-  /** ecritures en attente vers le disque, enchainees pour rester ordonnees */
   private pending: Promise<void> = Promise.resolve();
+  private closed = false;
 
-  constructor(private readonly sink?: ZipSink) {
-    this.zip = new Zip((err, data, final) => {
-      if (err) {
-        this.failure = err instanceof Error ? err : new Error(String(err));
-        return;
-      }
-      if (data) {
-        this.written += data.length;
-        if (this.sink) {
-          // fflate peut reutiliser ses tampons : on copie avant de differer.
-          const copy = data.slice();
-          const s = this.sink;
-          this.pending = this.pending.then(() => s.write(copy)).catch((e) => {
-            this.failure = e instanceof Error ? e : new Error(String(e));
-          });
-        } else {
-          this.buffered.push(data);
-          this.bufferedBytes += data.length;
-          if (this.bufferedBytes >= FLUSH_BYTES) this.spill();
-        }
-      }
-      if (final) {
-        this.finished = true;
-        this.onFinished?.();
-      }
-    });
+  constructor(private readonly sink?: ZipSink) {}
+
+  private emit(chunk: Uint8Array): void {
+    this.written += chunk.length;
+    if (this.sink) {
+      const s = this.sink;
+      this.pending = this.pending.then(() => s.write(chunk)).catch((e) => {
+        this.failure = e instanceof Error ? e : new Error(String(e));
+      });
+      return;
+    }
+    this.buffered.push(chunk);
+    this.bufferedBytes += chunk.length;
+    if (this.bufferedBytes >= FLUSH_BYTES) this.spill();
   }
 
   private spill(): void {
@@ -260,6 +290,79 @@ export class ZipStream {
     this.parts.push(new Blob(this.buffered as BlobPart[]));
     this.buffered = [];
     this.bufferedBytes = 0;
+  }
+
+  /**
+   * @param compress a laisser a false pour un .jar : c'est deja une archive
+   *   compressee, la recompresser coute du temps pour ~0 octet gagne.
+   * @returns false si le chemin est refuse ou deja present dans l'archive.
+   */
+  add(name: string, data: Uint8Array, compress = false): boolean {
+    if (this.failure) throw this.failure;
+    if (this.closed) throw new Error("Archive deja terminee.");
+
+    const clean = normalizePath(name);
+    if (!isSafePath(clean)) return false;
+
+    if (this.seen.has(clean)) return false;
+
+    const nameBytes = strToU8(clean);
+    if (nameBytes.length > 0xffff) return false;
+
+    const payload = compress ? deflateSync(data, { level: 6 }) : data;
+    // Une compression qui gonfle le fichier : on stocke tel quel.
+    const gonfle = compress && payload.length >= data.length;
+    const body = gonfle ? data : payload;
+    const method = compress && !gonfle ? 8 : 0;
+
+    const { date, time } = dosDateTime(new Date());
+    const record: EntryRecord = {
+      name: nameBytes,
+      crc: crc32(data),
+      compressed: body.length,
+      uncompressed: data.length,
+      method,
+      offset: this.written,
+      date,
+      time,
+    };
+
+    // Une entree de plus de 4 Go a besoin de Zip64 des l'en-tete local.
+    const gros = record.uncompressed > U32_MAX || record.compressed > U32_MAX;
+    const extra = gros ? 20 : 0;
+
+    const header = new Uint8Array(30 + nameBytes.length + extra);
+    const dv = new DataView(header.buffer);
+    dv.setUint32(0, 0x04034b50, true);
+    dv.setUint16(4, gros ? 45 : 20, true); // version minimale pour lire
+    dv.setUint16(6, 0x0800, true); // noms en UTF-8, pas de descripteur
+    dv.setUint16(8, method, true);
+    dv.setUint16(10, time, true);
+    dv.setUint16(12, date, true);
+    dv.setUint32(14, record.crc, true);
+    dv.setUint32(18, gros ? U32_MAX : record.compressed, true);
+    dv.setUint32(22, gros ? U32_MAX : record.uncompressed, true);
+    dv.setUint16(26, nameBytes.length, true);
+    dv.setUint16(28, extra, true);
+    header.set(nameBytes, 30);
+    if (gros) {
+      const z = new DataView(header.buffer, 30 + nameBytes.length, 20);
+      z.setUint16(0, 0x0001, true);
+      z.setUint16(2, 16, true);
+      z.setBigUint64(4, BigInt(record.uncompressed), true);
+      z.setBigUint64(12, BigInt(record.compressed), true);
+    }
+
+    this.emit(header);
+    this.emit(body);
+    this.entries.push(record);
+    this.seen.add(clean);
+    return true;
+  }
+
+  /** Octets deja ecrits, pour afficher la taille pendant la generation. */
+  get bytesWritten(): number {
+    return this.written;
   }
 
   /**
@@ -274,30 +377,76 @@ export class ZipStream {
     if (this.failure) throw this.failure;
   }
 
-  /**
-   * @param compress a laisser a false pour un .jar : c'est deja une archive
-   *   compressee, la recompresser coute du temps pour ~0 octet gagne.
-   */
-  add(name: string, data: Uint8Array, compress = false): boolean {
-    if (this.failure) throw this.failure;
-    const clean = normalizePath(name);
-    if (!isSafePath(clean)) return false;
+  /** Catalogue central, puis fin d'archive. */
+  private writeDirectory(): void {
+    const debut = this.written;
 
-    const entry = compress
-      ? new ZipDeflate(clean, { level: 6 })
-      : new ZipPassThrough(clean);
-    this.zip.add(entry);
-    // Pousse en un seul bloc, donc immediatement emis : fflate n'a jamais a
-    // mettre une entree en attente derriere une autre.
-    entry.push(data, true);
+    for (const e of this.entries) {
+      const champs: [number, number][] = [];
+      if (e.uncompressed > U32_MAX) champs.push([0, e.uncompressed]);
+      if (e.compressed > U32_MAX) champs.push([1, e.compressed]);
+      if (e.offset > U32_MAX) champs.push([2, e.offset]);
+      const extra = champs.length ? 4 + champs.length * 8 : 0;
 
-    if (this.failure) throw this.failure;
-    return true;
-  }
+      const c = new Uint8Array(46 + e.name.length + extra);
+      const dv = new DataView(c.buffer);
+      dv.setUint32(0, 0x02014b50, true);
+      dv.setUint16(4, extra ? 45 : 20, true); // version d'ecriture
+      dv.setUint16(6, extra ? 45 : 20, true); // version minimale pour lire
+      dv.setUint16(8, 0x0800, true);
+      dv.setUint16(10, e.method, true);
+      dv.setUint16(12, e.time, true);
+      dv.setUint16(14, e.date, true);
+      dv.setUint32(16, e.crc, true);
+      dv.setUint32(20, e.compressed > U32_MAX ? U32_MAX : e.compressed, true);
+      dv.setUint32(24, e.uncompressed > U32_MAX ? U32_MAX : e.uncompressed, true);
+      dv.setUint16(28, e.name.length, true);
+      dv.setUint16(30, extra, true);
+      dv.setUint32(42, e.offset > U32_MAX ? U32_MAX : e.offset, true);
+      c.set(e.name, 46);
+      if (extra) {
+        const z = new DataView(c.buffer, 46 + e.name.length, extra);
+        z.setUint16(0, 0x0001, true);
+        z.setUint16(2, extra - 4, true);
+        // L'ordre est impose par le format : taille decompressee, puis
+        // compressee, puis position — et seuls les champs satures figurent.
+        champs.forEach(([, valeur], i) => z.setBigUint64(4 + i * 8, BigInt(valeur), true));
+      }
+      this.emit(c);
+    }
 
-  /** Octets deja ecrits, pour afficher la taille pendant la generation. */
-  get bytesWritten(): number {
-    return this.written;
+    const taille = this.written - debut;
+    const nombre = this.entries.length;
+    // Zip64 devient obligatoire des qu'un des compteurs sature.
+    const besoinZip64 = nombre > 0xffff || debut > U32_MAX || taille > U32_MAX;
+
+    if (besoinZip64) {
+      const z = new Uint8Array(56 + 20);
+      const dv = new DataView(z.buffer);
+      dv.setUint32(0, 0x06064b50, true);
+      dv.setBigUint64(4, BigInt(44), true); // taille de l'enregistrement - 12
+      dv.setUint16(12, 45, true);
+      dv.setUint16(14, 45, true);
+      dv.setBigUint64(24, BigInt(nombre), true);
+      dv.setBigUint64(32, BigInt(nombre), true);
+      dv.setBigUint64(40, BigInt(taille), true);
+      dv.setBigUint64(48, BigInt(debut), true);
+      // Localisateur : signature (56), disque (60), position de
+      // l'enregistrement ci-dessus (64), nombre de disques (72).
+      dv.setUint32(56, 0x07064b50, true);
+      dv.setBigUint64(64, BigInt(this.written), true);
+      dv.setUint32(72, 1, true);
+      this.emit(z);
+    }
+
+    const fin = new Uint8Array(22);
+    const dv = new DataView(fin.buffer);
+    dv.setUint32(0, 0x06054b50, true);
+    dv.setUint16(8, Math.min(nombre, 0xffff), true);
+    dv.setUint16(10, Math.min(nombre, 0xffff), true);
+    dv.setUint32(12, Math.min(taille, U32_MAX), true);
+    dv.setUint32(16, Math.min(debut, U32_MAX), true);
+    this.emit(fin);
   }
 
   /**
@@ -306,11 +455,10 @@ export class ZipStream {
    */
   async finish(): Promise<Blob | null> {
     if (this.failure) throw this.failure;
-    await new Promise<void>((resolve) => {
-      this.onFinished = resolve;
-      this.zip.end();
-      if (this.finished) resolve();
-    });
+    if (!this.closed) {
+      this.writeDirectory();
+      this.closed = true;
+    }
     if (this.sink) {
       await this.pending;
       if (this.failure) throw this.failure;
@@ -324,6 +472,7 @@ export class ZipStream {
 
   /** Abandonne l'ecriture en cours, pour ne pas laisser un fichier tronque. */
   async abort(): Promise<void> {
+    this.closed = true;
     await this.sink?.abort?.().catch(() => {});
   }
 }

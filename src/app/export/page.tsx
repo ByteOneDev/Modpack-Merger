@@ -13,10 +13,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { PackSummaryView } from "@/components/pack-summary";
+import { ExportGate } from "@/components/export-gate";
 import { ManualDownloads } from "@/components/manual-downloads";
 import { useMerge } from "@/lib/store";
 import { readPackFiles } from "@/lib/analyze";
-import { buildPack, type BuildReport, type ExportFormat } from "@/lib/core/build";
+import { buildPack, IncompletePack, type BuildReport, type ExportFormat } from "@/lib/core/build";
+import { checkReadiness, summarizeBlockers } from "@/lib/readiness";
+import { excludeMany } from "@/lib/actions";
 import { buildSummary } from "@/lib/core/summary";
 import { countLabel } from "@/lib/core/content";
 import { loadManualFiles, pendingDownloads } from "@/lib/manual";
@@ -53,6 +56,7 @@ export default function ExportPage() {
     (r) => r.status === "ok" || r.status === "substituted",
   );
   const summary = buildSummary(state.resolutions);
+  const readiness = checkReadiness(state, { format, bundleJars });
   const pending = pendingDownloads(
     state.resolutions,
     state.manualFiles,
@@ -83,6 +87,9 @@ export default function ExportPage() {
         ram: state.ram ?? undefined,
         manualFiles,
         sink: destination?.sink,
+        // Le verrou ci-dessus couvre ce qui est connu d'avance ; ceci couvre
+        // les coupures survenues pendant le telechargement.
+        requireComplete: true,
         onProgress: (step, done, total) => setProgress({ step, done, total }),
       });
 
@@ -100,6 +107,20 @@ export default function ExportPage() {
       }));
     } catch (err) {
       setSavedTo(null);
+      if (err instanceof IncompletePack) {
+        // Les echecs deviennent des obstacles : la prochaine tentative est
+        // bloquee tant qu'ils ne sont pas traites.
+        setState((prev) => ({
+          ...prev,
+          failedDownloads: err.manquants.map((m) => m.key),
+        }));
+        setError(
+          `Generation interrompue : ${err.manquants.length} fichier(s) n'ont pas pu etre ` +
+            "recuperes malgre plusieurs tentatives. Rien n'a ete ecrit — ils sont listes " +
+            "ci-dessus, a recuperer a la main ou a ecarter.",
+        );
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       setError(
         /allocation failed|out of memory|Array buffer/i.test(message)
@@ -152,6 +173,14 @@ export default function ExportPage() {
           />
         </div>
       )}
+
+      <ExportGate
+        readiness={readiness}
+        onGoToMods={() => router.push("/mods/")}
+        onExclude={(keys) =>
+          setState((prev) => ({ ...prev, ...excludeMany(prev, keys, settings) }))
+        }
+      />
 
       <Card className="mb-6">
         <CardHeader>
@@ -222,6 +251,13 @@ export default function ExportPage() {
         </Alert>
       )}
 
+      {readiness.warnings.map((w, i) => (
+        <Alert variant="warning" className="mb-6" key={i}>
+          <TriangleAlert />
+          <AlertDescription>{w}</AlertDescription>
+        </Alert>
+      ))}
+
       {error && (
         <Alert variant="destructive" className="mb-6">
           <TriangleAlert />
@@ -246,10 +282,15 @@ export default function ExportPage() {
           </CardContent>
         </Card>
       ) : (
-        <div className="mb-6 flex items-center gap-3">
-          <Button size="lg" onClick={() => void run()}>
+        <div className="mb-6 flex flex-wrap items-center gap-3">
+          <Button size="lg" onClick={() => void run()} disabled={!readiness.ready}>
             <Download /> Generer et telecharger
           </Button>
+          {!readiness.ready && (
+            <span className="text-muted-foreground text-sm">
+              Bloque : {summarizeBlockers(readiness)}.
+            </span>
+          )}
           <Button variant="outline" onClick={() => router.push("/fichiers/")}>
             Retour
           </Button>

@@ -16,6 +16,35 @@ import { humanSize } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /**
+ * Deux raisons possibles d'atterrir ici, qui n'appellent pas le meme geste :
+ * un auteur qui refuse la distribution, ou un CDN qui a refuse la requete.
+ */
+function description(pending: PendingDownload[], done: boolean): string {
+  if (done) return "Tout le contenu du pack est téléchargeable automatiquement.";
+
+  const refus = pending.filter((p) => p.reason === "distribution").length;
+  const echecs = pending.length - refus;
+
+  if (refus && echecs) {
+    return (
+      `${refus} fichier(s) dont l'auteur interdit la distribution par des tiers, et ` +
+      `${echecs} dont le téléchargement a échoué. Ouvre leur page — la bonne version est déjà ` +
+      "sélectionnée — puis rends le fichier téléchargé."
+    );
+  }
+  if (echecs) {
+    return (
+      "Le CDN a refusé ces requêtes lors de la dernière génération. Relance-la pour réessayer, " +
+      "ou récupère les fichiers depuis leur page et rends-les ici."
+    );
+  }
+  return (
+    "Ces auteurs interdisent la distribution de leur fichier par des tiers. Ouvre la page — la " +
+    "bonne version est déjà sélectionnée — puis rends le fichier téléchargé."
+  );
+}
+
+/**
  * Recuperation des fichiers que l'API ne peut pas livrer.
  *
  * Meme principe que Prism Launcher : l'outil ouvre la page du fichier exact,
@@ -115,12 +144,7 @@ export function ManualDownloads({
           Téléchargements manuels
           {!done && <Badge variant="warning">{pending.length}</Badge>}
         </CardTitle>
-        <CardDescription>
-          {done
-            ? "Tout le contenu du pack est téléchargeable automatiquement."
-            : "Ces auteurs interdisent la distribution de leur fichier par des tiers. " +
-              "Ouvre la page — la bonne version est déjà sélectionnée — puis rends le fichier téléchargé."}
-        </CardDescription>
+        <CardDescription>{description(pending, done)}</CardDescription>
       </CardHeader>
 
       {!done && (
@@ -298,7 +322,7 @@ export function ManualDownloads({
         </CardContent>
       )}
 
-      {!done && (
+      {!done && pending.some((p) => p.reason === "distribution") && (
         <CardContent className="pt-0">
           <Alert variant="info">
             <TriangleAlert />

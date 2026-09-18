@@ -292,6 +292,54 @@ L'archive contient toujours un `RAPPORT-DE-FUSION.md` : l'inventaire complet
 par type, la répartition client/serveur, ce qui a été gardé, remplacé, écarté,
 abandonné, et la RAM recommandée avec son calcul.
 
+#### Un pack incomplet ne sort pas
+
+La génération est **refusée** tant qu'il manque quelque chose. Un modpack
+auquel il manque des morceaux ne se voit pas : l'archive s'ouvre, s'installe,
+et le jeu plante ou refuse la connexion des semaines plus tard.
+
+Trois choses bloquent :
+
+| Obstacle | Comment le lever |
+|---|---|
+| Élément sans version compatible | chercher une alternative, ou l'écarter |
+| Fichier non distribuable par un tiers | le récupérer depuis sa page |
+| Téléchargement échoué à la génération précédente | relancer, ou le récupérer à la main |
+
+Un seul cas fait exception : un **manifeste CurseForge**, où les fichiers ne
+sont que des numéros de projet et l'application CurseForge ouvre elle-même la
+page quand l'auteur refuse la distribution. Un `.mrpack` n'a pas cette
+possibilité, donc le fichier doit être là.
+
+Rien ne se contourne en silence. Le seul moyen de passer outre est **d'écarter
+explicitement** ce qui manque : le pack ne les contient alors pas, et le
+`RAPPORT-DE-FUSION.md` le consigne. C'est une décision, pas un contournement.
+
+Le verrou couvre aussi ce qui casse *pendant* la génération : chaque fichier
+est retenté trois fois, et si l'un ne passe toujours pas, **rien n'est livré**
+— le fichier en cours d'écriture est supprimé plutôt que de laisser une
+archive tronquée qui ressemble à une archive valide.
+
+#### Compatibilité de l'archive
+
+L'archive est écrite par un writer maison plutôt que par un utilitaire tout
+fait, pour deux raisons précises :
+
+- un writer en flux ne connaît pas la longueur d'une entrée au moment d'écrire
+  son en-tête local. Il y laisse donc CRC et tailles à zéro et pose le drapeau
+  *data descriptor*. C'est légal, mais c'est la variante du format la plus mal
+  supportée — **QuaZip, qu'utilise Prism Launcher, échoue dessus**. Ici chaque
+  entrée est poussée entière, donc son empreinte et sa taille sont connues
+  avant l'en-tête : elles y figurent, et aucun descripteur n'est nécessaire ;
+- les enregistrements **Zip64** sont écrits quand il le faut. Sans eux une
+  archive plafonne à 4 Go ou 65 535 entrées, ce qu'un pack complet de plusieurs
+  centaines de mods dépasse.
+
+Une destination n'est écrite qu'une fois : deux sources peuvent viser le même
+chemin (un fichier `client-overrides/` et son équivalent commun repliés
+ensemble pour le format CurseForge), et une archive contenant deux fois la même
+entrée est acceptée par certains outils et refusée par d'autres.
+
 #### Archives volumineuses
 
 L'archive est écrite **en flux**, entrée par entrée : rien n'est assemblé en
@@ -337,6 +385,7 @@ src/
       zip.ts              lecture protégée et écriture en flux des archives
       build.ts            génération de l'archive
     manual.ts             fichiers récupérés à la main (appariement, dossier surveillé)
+    readiness.ts          ce qui doit être réuni avant de pouvoir générer
     save.ts               destination de l'archive : disque en flux ou Blob
     store.tsx             état de l'assistant (React context + IndexedDB)
     settings.ts           préférences (localStorage)
