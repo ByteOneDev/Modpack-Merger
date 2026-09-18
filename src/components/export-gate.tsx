@@ -9,12 +9,17 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import type { Blocker, Readiness } from "@/lib/readiness";
 
 const TITRE: Record<Blocker["kind"], string> = {
+  version: "Versions incompatibles entre elles",
   missing: "Sans version compatible",
   manual: "À récupérer à la main",
   failed: "Téléchargement échoué",
 };
 
 const AIDE: Record<Blocker["kind"], string> = {
+  version:
+    "Un mod exige une version précise d'un autre, et ce n'est pas celle retenue. Le pack " +
+    "s'installerait sans rien dire, puis planterait au chargement du monde. Le réglage se fait " +
+    "à l'étape Mods : rétrograder, ou retirer le mod exigeant.",
   missing:
     "Ces éléments n'existent pas pour la cible choisie. Cherche une alternative à l'étape Mods, " +
     "ou écarte-les si tu peux t'en passer.",
@@ -45,11 +50,16 @@ export function ExportGate({
 }) {
   const groupes = (
     [
+      { kind: "version", items: readiness.version },
       { kind: "missing", items: readiness.missing },
       { kind: "manual", items: readiness.manual },
       { kind: "failed", items: readiness.failed },
     ] as { kind: Blocker["kind"]; items: Blocker[] }[]
   ).filter((g) => g.items.length > 0);
+
+  // Un conflit de version ne se regle pas en ecartant : la cle designe une
+  // paire de mods, pas un element du pack.
+  const ecartables = readiness.blockers.filter((b) => b.kind !== "version").length;
 
   if (readiness.ready) {
     return (
@@ -73,9 +83,13 @@ export function ExportGate({
           <Badge variant="destructive">{readiness.blockers.length}</Badge>
         </CardTitle>
         <CardDescription>
-          Il manque de quoi construire le pack en entier. Une archive incomplète s&apos;installe
-          sans broncher et ne se trahit qu&apos;au démarrage du jeu — l&apos;outil préfère ne rien
-          produire.
+          {ecartables === 0
+            ? "Le pack est complet, mais deux mods exigent des versions qui ne vont pas ensemble. " +
+              "Il s'installerait sans broncher et planterait au chargement du monde — l'outil " +
+              "préfère ne rien produire."
+            : "Il manque de quoi construire le pack en entier. Une archive incomplète s'installe " +
+              "sans broncher et ne se trahit qu'au démarrage du jeu — l'outil préfère ne rien " +
+              "produire."}
         </CardDescription>
       </CardHeader>
 
@@ -96,15 +110,17 @@ export function ExportGate({
                     <div className="text-sm font-medium">{b.name}</div>
                     <p className="text-muted-foreground mt-0.5 text-xs text-pretty">{b.detail}</p>
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={`Écarter ${b.name}`}
-                    title="Écarter cet élément du pack"
-                    onClick={() => onExclude([b.key])}
-                  >
-                    <Trash2 />
-                  </Button>
+                  {b.kind !== "version" && (
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`Écarter ${b.name}`}
+                      title="Écarter cet élément du pack"
+                      onClick={() => onExclude([b.key])}
+                    >
+                      <Trash2 />
+                    </Button>
+                  )}
                 </div>
               ))}
             </div>
@@ -114,31 +130,42 @@ export function ExportGate({
                 <Search /> Chercher des alternatives
               </Button>
             )}
+            {g.kind === "version" && (
+              <Button variant="outline" size="sm" className="mt-2" onClick={onGoToMods}>
+                <Search /> Régler à l&apos;étape Mods
+              </Button>
+            )}
           </section>
         ))}
 
-        <Alert variant="warning">
-          <TriangleAlert />
-          <AlertTitle>Se passer de ces éléments</AlertTitle>
-          <AlertDescription>
-            <p>
-              Les écarter débloque la génération. Ils ne seront pas dans le pack, et le{" "}
-              <code className="font-mono text-xs">RAPPORT-DE-FUSION.md</code> en gardera la trace —
-              c&apos;est un choix assumé, pas un contournement.
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="mt-2"
-              onClick={() => onExclude(readiness.blockers.map((b) => b.key))}
-            >
-              <Trash2 />
-              {readiness.blockers.length === 1
-                ? "Écarter cet élément et continuer"
-                : `Écarter ces ${readiness.blockers.length} éléments et continuer`}
-            </Button>
-          </AlertDescription>
-        </Alert>
+        {ecartables > 0 && (
+          <Alert variant="warning">
+            <TriangleAlert />
+            <AlertTitle>Se passer de ces éléments</AlertTitle>
+            <AlertDescription>
+              <p>
+                Les écarter débloque la génération. Ils ne seront pas dans le pack, et le{" "}
+                <code className="font-mono text-xs">RAPPORT-DE-FUSION.md</code> en gardera la trace
+                — c&apos;est un choix assumé, pas un contournement.
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-2"
+                onClick={() =>
+                  onExclude(
+                    readiness.blockers.filter((b) => b.kind !== "version").map((b) => b.key),
+                  )
+                }
+              >
+                <Trash2 />
+                {ecartables === 1
+                  ? "Écarter cet élément et continuer"
+                  : `Écarter ces ${ecartables} éléments et continuer`}
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
       </CardContent>
     </Card>
   );

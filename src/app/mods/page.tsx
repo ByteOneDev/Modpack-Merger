@@ -12,6 +12,7 @@ import { RamCard } from "@/components/ram-card";
 import { AlternativesList } from "@/components/alternatives";
 import { BulkAlternatives } from "@/components/bulk-alternatives";
 import { AddContent } from "@/components/add-content";
+import { PinnedConflicts } from "@/components/pinned-conflicts";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,8 +22,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useMerge } from "@/lib/store";
 import {
-  addMod, addSchematics, applyAlternative, applyAlternatives, excludeMod, resolveConflict,
-  restoreMod,
+  addMod, addSchematics, alignPinnedVersion, applyAlternative, applyAlternatives, excludeMod,
+  resolveConflict, restoreMod,
 } from "@/lib/actions";
 import { detectSchematicFolder } from "@/lib/core/build";
 import { CONTENT_INFO, SCHEMATIC_MODS, countLabel, type ContentKind } from "@/lib/core/content";
@@ -82,10 +83,15 @@ export default function ModsPage() {
         </div>
       )}
 
-      <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
         <Stat label="Elements retenus" value={kept.length + substituted.length} tone="success" />
         <Stat label="Introuvables" value={missing.length} tone={missing.length ? "danger" : undefined} />
         <Stat label="Dependances ajoutees" value={deps.length} tone="info" />
+        <Stat
+          label="Versions incompatibles"
+          value={state.pinnedConflicts.length}
+          tone={state.pinnedConflicts.length ? "danger" : undefined}
+        />
         <Stat
           label="Doublons fonctionnels"
           value={state.conflicts.length}
@@ -99,6 +105,19 @@ export default function ModsPage() {
           <RamCard ram={state.ram} />
         </div>
       )}
+
+      <PinnedConflicts
+        conflicts={state.pinnedConflicts}
+        resolutions={state.resolutions}
+        onAlign={async (c) => {
+          const patch = await alignPinnedVersion(state, c, settings);
+          if (!patch.error) setState((prev) => ({ ...prev, ...patch }));
+          return patch;
+        }}
+        onDropDependent={(key) =>
+          setState((prev) => ({ ...prev, ...excludeMod(state, key, settings) }))
+        }
+      />
 
       {missing.length > 0 && (
         <Card className="mb-6">

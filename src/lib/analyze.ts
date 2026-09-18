@@ -5,6 +5,7 @@ import { extractOverrides } from "@/lib/core/parse";
 import { dedupe, enrichEnvironments, resolveAll } from "@/lib/core/merge/resolve";
 import { resolveDependencies } from "@/lib/core/merge/deps";
 import { detectFunctionalConflicts } from "@/lib/core/merge/functional";
+import { detectPinnedConflicts } from "@/lib/core/merge/pinned";
 import { computeOverrideConflicts, type PackFiles } from "@/lib/core/merge/overrides";
 import { estimateRam } from "@/lib/core/merge/ram";
 import { loadArchive } from "@/lib/archives";
@@ -78,6 +79,11 @@ export async function runAnalysis(
     ? detectFunctionalConflicts(withDeps)
     : [];
 
+  // 4 bis. dependances exigeant une version precise. Toujours verifie : un
+  // mod qui reecrit les classes d'un autre plante si la version ne correspond
+  // pas, et rien ne le signale avant le chargement du monde.
+  const pinnedConflicts = detectPinnedConflicts(withDeps);
+
   // 5. conflits de fichiers d'instance
   onProgress({ phase: "Comparaison des fichiers de configuration", done: 0, total: 1 });
   const packFiles = await readPackFiles(packs);
@@ -101,6 +107,7 @@ export async function runAnalysis(
   return {
     resolutions: withDeps,
     conflicts,
+    pinnedConflicts,
     overrideConflicts,
     overrideStats: { uniqueCount, identicalCount },
     decisions,

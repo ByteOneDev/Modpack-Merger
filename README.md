@@ -137,6 +137,19 @@ Un pack ne contient pas que des mods : les `resourcepacks/`, `shaderpacks/` et
 entière, résolus sur les deux plateformes et replacés dans le bon dossier à
 l'export — pas recopiés en vrac.
 
+**Les jars posés dans `mods/` sans figurer au manifeste participent à la
+fusion.** Un pack CurseForge ou Modrinth ne liste dans son manifeste que ce qui
+vient de la plateforme ; tout le reste — mods absents du catalogue, versions
+bricolées, jars récupérés à la main — est simplement déposé dans
+`overrides/mods/`. Les traiter comme des fichiers de configuration les ferait
+passer à côté du choix de loader, de la déduplication et des mises à jour. Ils
+sont donc identifiés par empreinte, comme ceux d'une archive brute.
+
+Rien n'est décompressé pour lire le catalogue d'une archive : sur un pack qui
+embarque un monde sauvegardé, ouvrir chaque fichier pour connaître son nom
+représente plusieurs centaines de Mo pour rien. Les jars sont ouverts par lots
+bornés, puis relâchés.
+
 Pour une archive brute, chaque `.jar` est aussi ouvert pour lire ses
 métadonnées internes (`fabric.mod.json`, `quilt.mod.json`,
 `META-INF/mods.toml`, `META-INF/neoforge.mods.toml`), ce qui permet
@@ -161,10 +174,24 @@ d'identifier même un mod jamais publié.
    basculer sur la plus récente quoi qu'il arrive.
 4. **Dépendances** — les dépendances requises manquantes sont ajoutées
    récursivement, dans la bonne version.
-5. **Doublons fonctionnels** — des mods différents qui font la même chose sont
+5. **Versions épinglées** — certains mods n'exigent pas seulement la *présence* d'un
+   autre mod, mais une **version précise**, parce qu'ils en réécrivent les
+   classes internes. Iris 1.8.12 exige Sodium 0.6.13 ; à côté de Sodium 0.8.13,
+   le pack s'installe normalement puis plante au chargement du monde sur un
+   `ClassNotFoundException` qui ne nomme ni l'un ni l'autre.
+
+   « La version la plus récente de chaque mod » et « un ensemble qui démarre »
+   ne sont pas la même chose. Ces contraintes sont vérifiées, et l'écran propose
+   soit de rétrograder la dépendance, soit de retirer le mod exigeant. Tant
+   qu'un conflit reste, **l'export est bloqué**.
+
+   Seul Modrinth publie ces contraintes ; les dépendances CurseForge ne
+   désignent qu'un projet, sans version. Un conflit venant uniquement de
+   CurseForge reste donc invisible.
+6. **Doublons fonctionnels** — des mods différents qui font la même chose sont
    détectés : `bloquant` (deux moteurs de rendu = crash au démarrage) ou
    `redondant` (deux minimaps). Un clic écarte les autres.
-6. **Fichiers de configuration** — seuls les fichiers fournis par plusieurs
+7. **Fichiers de configuration** — seuls les fichiers fournis par plusieurs
    packs avec un contenu différent demandent un arbitrage. Par fichier : garder
    la version d'un pack précis, fusionner, tout garder (les non prioritaires
    renommés), ou ignorer.
@@ -187,8 +214,14 @@ Dans les deux cas, la recherche fonctionne ainsi :
 - une recherche sur les deux plateformes, notée sur la popularité, la
   fraîcheur de maintenance et la proximité du nom.
 
-Deux garanties :
+Trois garanties :
 
+- **une proposition doit vraiment porter le nom du mod cherché.** La recherche
+  textuelle des deux plateformes renvoie beaucoup de bruit : sans ce filtre,
+  un mod simplement populaire et récent remonte en tête, et « Create » se voit
+  proposer « Chimes ». Les compléments sont écartés aussi — « Refined Storage:
+  Powerless Addon » dépend de Refined Storage au lieu de s'y substituer. Quand
+  un nom tient en un seul mot, la ressemblance exigée est quasi totale ;
 - **chaque proposition a réellement une version installable** sur la cible —
   les candidats sans version compatible sont écartés avant affichage ;
 - **les forks sont pénalisés et étiquetés**. Un fork n'arrive en tête que si
@@ -259,9 +292,11 @@ fichier exact — bonne version déjà sélectionnée — et récupère ensuite 
   ouverts.
 
 Les fichiers rendus sont **appariés par empreinte sha1**, pas par nom : un
-fichier renommé est reconnu, et une mauvaise version est détectée. Le repli par
-le nom existe, et l'app indique alors que l'empreinte n'a pas pu être
-confirmée.
+fichier renommé est reconnu. Quand l'empreinte attendue est connue et que le
+fichier ne correspond pas, il est **refusé** avec la raison — accepter
+`SubtleEffects-neoforge-1.21.1.jar` parce que son nom ressemble mettrait un jar
+NeoForge dans un pack Fabric, qui s'installerait puis planterait au démarrage.
+Le repli par le nom ne sert que lorsqu'aucune empreinte de référence n'existe.
 
 Les échecs de téléchargement d'un export précédent (CDN qui refuse la requête)
 rejoignent la même liste : le besoin est identique.
@@ -302,6 +337,7 @@ Trois choses bloquent :
 
 | Obstacle | Comment le lever |
 |---|---|
+| Deux mods qui exigent des versions incompatibles | rétrograder, ou retirer le mod exigeant |
 | Élément sans version compatible | chercher une alternative, ou l'écarter |
 | Fichier non distribuable par un tiers | le récupérer depuis sa page |
 | Téléchargement échoué à la génération précédente | relancer, ou le récupérer à la main |
@@ -376,6 +412,7 @@ src/
       merge/
         knowledge.ts      équivalences, conflits, profils mémoire — le cœur éditorial
         resolve.ts        déduplication et choix de version
+        pinned.ts         dépendances exigeant une version précise
         alternatives.ts   recherche et notation des remplaçants
         overrides.ts      fusion N-way des fichiers de config
         ram.ts            estimation de mémoire
@@ -412,6 +449,10 @@ la place occupée et permet de tout effacer.
   sévérité et l'ordre de préférence ;
 - `MEMORY_PROFILE` — surcoûts et économies mémoire par mod ;
 - `LOADER_ONLY` — mods dont l'absence sur un loader donné est normale.
+
+Deux exemples ajoutés depuis des packs réels : **Litematica → Forgematica** et
+**MaLiLib → MaFgLib** sur Forge et NeoForge. Ce sont des portages sous un autre
+nom : aucune recherche textuelle ne les rapproche, seule la table le peut.
 
 Ajouter une entrée suffit, les index sont construits automatiquement.
 
@@ -451,6 +492,15 @@ quota CurseForge. Renseigne `ALLOWED_ORIGIN` (Worker du site) ou `ALLOWED_ORIGIN
 - Le téléchargement des jars se fait depuis le navigateur : certains CDN
   refusent les requêtes venant d'une page web. Les mods concernés basculent
   dans *Téléchargements manuels*. Le mode *manifeste seul* évite le problème.
+- **Mémoire.** Les archives sont lues en entier pour être ouvertes : compter
+  environ 1,7 Go de pointe pour 1,1 Go de packs à la lecture, et 2,2 Go à
+  l'export, où les fichiers d'instance des deux packs sont gardés le temps de
+  les comparer. Un pack qui embarque un monde sauvegardé pèse lourd pour rien :
+  sur les packs de test, `saves/` représente 1073 des 1847 fichiers de
+  l'archive produite.
+- Si le navigateur refuse de stocker les archives (navigation privée, quota
+  dépassé), l'outil continue de fonctionner pour la session en cours et le dit,
+  mais l'avancement ne survit pas à un rechargement.
 - Un mod dont l'auteur a désactivé la distribution tierce sur CurseForge ne
   peut pas être téléchargé automatiquement — par respect de son choix, pas par
   impossibilité technique. L'écran *Téléchargements manuels* ouvre sa page et

@@ -78,22 +78,37 @@ export function ManualDownloads({
         setMessage({ ok: false, text: "Aucun fichier exploitable dans la sélection." });
         return;
       }
-      const { matched, unmatched } = await matchFiles(files, pending);
+      const { matched, rejets } = await matchFiles(files, pending);
       const next = { ...have };
       for (const m of matched) next[m.key] = m.info;
       onChange(next);
 
-      const doubtful = matched.filter((m) => !m.info.verified);
+      const mauvaises = rejets.filter((r) => r.raison === "mauvaise version");
+      const ignores = rejets.length - mauvaises.length;
+      const bouts: string[] = [];
+      if (matched.length) {
+        const sansEmpreinte = matched.filter((m) => !m.info.verified).length;
+        bouts.push(
+          `${matched.length} fichier(s) rattaché(s)` +
+            (sansEmpreinte
+              ? ` — dont ${sansEmpreinte} sans empreinte de référence à comparer`
+              : ", empreintes vérifiées"),
+        );
+      }
+      if (mauvaises.length) {
+        bouts.push(
+          `${mauvaises.length} écarté(s), mauvaise version : ` +
+            mauvaises
+              .slice(0, 3)
+              .map((r) => `${r.fileName} n'est pas le fichier attendu pour ${r.attenduPour}`)
+              .join(" ; "),
+        );
+      }
+      if (ignores) bouts.push(`${ignores} sans rapport avec ce qui manque`);
+
       setMessage({
         ok: matched.length > 0,
-        text:
-          matched.length === 0
-            ? `Aucun des ${files.length} fichiers ne correspond à ce qui manque.`
-            : `${matched.length} fichier(s) rattaché(s)` +
-              (doubtful.length
-                ? ` — dont ${doubtful.length} reconnu(s) par leur nom seulement, l'empreinte ne correspond pas.`
-                : ", empreintes vérifiées.") +
-              (unmatched.length ? ` ${unmatched.length} ignoré(s).` : ""),
+        text: bouts.join(". ") + "." || `Aucun des ${files.length} fichiers ne correspond.`,
       });
     },
     [pending, have, onChange],

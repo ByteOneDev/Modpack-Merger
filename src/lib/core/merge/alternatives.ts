@@ -37,6 +37,7 @@ function scoreProject(
   project: ProviderProject,
   wanted: string,
   curated: boolean,
+  pertinence = 0,
 ): Scored {
   const { isFork, signal } = detectFork(
     project.title,
@@ -70,9 +71,11 @@ function scoreProject(
     }
   }
 
-  // Correspondance du nom avec le mod remplace
-  const sim = titleSimilarity(normalizeTitle(project.title), wanted);
-  score += sim * 15;
+  // Ressemblance du nom : c'est le signal le plus fort apres la table curee.
+  // Le laisser derriere la popularite faisait remonter n'importe quel mod
+  // tres telecharge renvoye par la recherche.
+  score += pertinence * 45;
+  if (pertinence >= 0.6) parts.push("nom tres proche");
 
   // Une correspondance curee encode un jugement editorial : elle domine.
   if (curated) {
@@ -96,13 +99,47 @@ function scoreProject(
   };
 }
 
-function titleSimilarity(a: string, b: string): number {
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-  if (a.includes(b) || b.includes(a)) return 0.6;
-  const setA = new Set(a.split(""));
-  const common = [...new Set(b.split(""))].filter((c) => setA.has(c)).length;
-  return common / Math.max(setA.size, 1) / 2;
+/** Mots trop courants pour dire quoi que ce soit d'un mod. */
+const MOTS_VIDES = new Set([
+  "mod", "mods", "fabric", "forge", "neoforge", "quilt", "api", "lib", "library",
+  "minecraft", "port", "edition", "reforged", "continued", "unofficial", "for",
+  "and", "the", "with", "new", "more", "plus",
+]);
+
+function jetons(titre: string): Set<string> {
+  return new Set(
+    titre
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(" ")
+      .filter((m) => m.length >= 3 && !MOTS_VIDES.has(m)),
+  );
+}
+
+/** Coefficient de Dice : 1 si les deux titres portent les memes mots. */
+function recouvrement(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let communs = 0;
+  for (const mot of a) if (b.has(mot)) communs++;
+  return (2 * communs) / (a.size + b.size);
+}
+
+/**
+ * Marqueurs d'un complement : un addon n'est pas un remplacant.
+ *
+ * « Refined Storage: Powerless Addon » ou « Aero Islands [for Create
+ * Aeronautics] » portent le nom du mod cherche et sortent donc en tete d'une
+ * comparaison de titres — alors qu'ils en dependent au lieu de s'y
+ * substituer.
+ */
+const MARQUEURS_COMPLEMENT =
+  /\b(add-?ons?|extensions?|compat(?:ibility)?|patch(?:es)?|integrations?|supports?|plugins?|tweaks?|for)\b/i;
+
+function estComplementDe(project: ProviderProject, jetonsVoulus: Set<string>): boolean {
+  if (!MARQUEURS_COMPLEMENT.test(project.title)) return false;
+  const siens = jetons(project.title);
+  for (const mot of jetonsVoulus) if (siens.has(mot)) return true;
+  return false;
 }
 
 function formatDownloads(n: number): string {
@@ -139,11 +176,24 @@ export async function findAlternatives(
     for (const p of fetched) {
       if (!p) continue;
       if (normalizeTitle(p.title) === wanted) continue; // c'est le mod lui-meme
-      candidates.set(p.projectId, scoreProject(p, wanted, true));
+      candidates.set(p.projectId, scoreProject(p, wanted, true, 1));
     }
   }
 
   // 2. recherche textuelle sur les deux plateformes
+  //
+  // La recherche renvoie beaucoup de bruit : sur « Create », les deux
+  // plateformes proposent des dizaines de mods sans rapport. Un candidat
+  // n'est retenu que s'il porte vraiment le nom du mod cherche — sans quoi
+  // une proposition « convaincante » n'est qu'un mod populaire pris au hasard.
+  const jetonsVoulus = jetons(name);
+
+  // Un nom d'un seul mot ne discrimine rien : « Create » se retrouve dans
+  // « F**k Create World », qui n'en est pas un remplacant. Dans ce cas on
+  // exige un titre quasi identique ; un vrai remplacant d'un mod au nom court
+  // est de toute facon un portage du meme nom.
+  const PERTINENCE_MIN = jetonsVoulus.size <= 1 ? 0.8 : 0.34;
+
   const queries = [name];
   if (eq) queries.push(eq.label);
   const searched = await Promise.all(
@@ -152,7 +202,11 @@ export async function findAlternatives(
   for (const p of searched.flat()) {
     if (candidates.has(p.projectId)) continue;
     if (normalizeTitle(p.title) === wanted && p.provider === mod?.provider) continue;
-    candidates.set(p.projectId, scoreProject(p, wanted, false));
+    if (estComplementDe(p, jetonsVoulus)) continue;
+
+    const pertinence = recouvrement(jetons(p.title), jetonsVoulus);
+    if (pertinence < PERTINENCE_MIN) continue;
+    candidates.set(p.projectId, scoreProject(p, wanted, false, pertinence));
   }
 
   // 3. on ne propose que ce qui existe vraiment sur la cible : chaque
@@ -182,8 +236,18 @@ export async function findAlternatives(
     });
   }
 
+  if (!alternatives.length) {
+    return {
+      alternatives: [],
+      note:
+        "Aucun remplacant convaincant. Les mods proches par le nom n'ont pas de " +
+        "version installable ici, et rien d'autre ne couvre la meme fonction : " +
+        `${name} est a retirer, ou a recuperer en changeant de cible.`,
+    };
+  }
+
   // Si tout ce qui reste est un fork, on le dit clairement.
-  const onlyForks = alternatives.length > 0 && alternatives.every((a) => a.isFork);
+  const onlyForks = alternatives.every((a) => a.isFork);
   const note = onlyForks
     ? "Aucun mod original ne couvre cette fonction sur la configuration cible. " +
       "Les propositions ci-dessous sont toutes des forks : elles fonctionnent, " +

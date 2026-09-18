@@ -180,8 +180,8 @@ export function BulkAlternatives({
           Tout decocher
         </Button>
         <Button disabled={!selectedCount || !!applying} onClick={() => void apply()}>
-          <Check /> Appliquer {selectedCount > 1 ? "les " : "le "}
-          {plural(selectedCount, "choix", "choix")}
+          <Check />
+          {selectedCount > 1 ? `Appliquer les ${selectedCount} choix` : "Appliquer ce choix"}
         </Button>
       </div>
 

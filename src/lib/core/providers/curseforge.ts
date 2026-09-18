@@ -277,6 +277,18 @@ export const curseforge = {
     return withProjectInfo(unique);
   },
 
+  /**
+   * Une version precise, par son identifiant de fichier.
+   *
+   * CurseForge ne permet pas d'epingler une version dans ses declarations de
+   * dependance — elles ne portent qu'un numero de projet. Cette methode
+   * existe pour l'uniformite de l'interface.
+   */
+  async getVersionById(fileId: string): Promise<ProviderVersion | null> {
+    const [v] = await curseforge.getFiles([fileId]);
+    return v ?? null;
+  },
+
   async getFiles(fileIds: string[]): Promise<ProviderVersion[]> {
     if (!base()) return [];
     const out: ProviderVersion[] = [];

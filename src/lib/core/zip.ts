@@ -147,6 +147,59 @@ export function surveyZip(buf: Uint8Array): ZipSurvey {
  *   ne veut que les fichiers de configuration evite de charger plusieurs Go
  *   en memoire pour rien.
  */
+export interface ZipEntryInfo {
+  path: string;
+  /** taille une fois decompressee */
+  size: number;
+}
+
+/**
+ * Liste le contenu sans rien decompresser.
+ *
+ * Permet de decider quoi extraire avant d'en payer le prix : sur un pack de
+ * 900 Mo, tout decompresser pour ne garder que quelques jars sature la
+ * memoire de l'onglet.
+ */
+export function listZipEntries(buf: Uint8Array): ZipEntryInfo[] {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const scanFrom = Math.max(0, buf.length - 65_557);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= scanFrom; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd === -1) return [];
+
+  let count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  if (count === 0xffff || p === 0xffffffff) {
+    const locator = eocd - 20;
+    if (locator >= 0 && dv.getUint32(locator, true) === 0x07064b50) {
+      const z64 = Number(dv.getBigUint64(locator + 8, true));
+      if (z64 >= 0 && z64 + 56 <= buf.length && dv.getUint32(z64, true) === 0x06064b50) {
+        count = Number(dv.getBigUint64(z64 + 32, true));
+        p = Number(dv.getBigUint64(z64 + 48, true));
+      }
+    }
+  }
+
+  const dec = new TextDecoder();
+  const out: ZipEntryInfo[] = [];
+  for (let i = 0; i < count && p + 46 <= buf.length; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const size = dv.getUint32(p + 24, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const commentLen = dv.getUint16(p + 32, true);
+    const path = normalizePath(dec.decode(buf.subarray(p + 46, p + 46 + nameLen)));
+    if (!path.endsWith("/") && isSafePath(path)) out.push({ path, size });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
 export function readZip(buf: Uint8Array, keep?: (path: string) => boolean): ZipEntries {
   if (buf.length > ZIP_LIMITS.maxArchiveBytes) {
     throw new ZipRejected("Archive refusee : plus de 4 Go.");

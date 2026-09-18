@@ -18,7 +18,7 @@ import type { MergeState } from "@/lib/store";
  * consignee dans le rapport.
  */
 
-export type BlockerKind = "missing" | "manual" | "failed";
+export type BlockerKind = "missing" | "manual" | "failed" | "version";
 
 export interface Blocker {
   kind: BlockerKind;
@@ -35,6 +35,7 @@ export interface Readiness {
   missing: Blocker[];
   manual: Blocker[];
   failed: Blocker[];
+  version: Blocker[];
   /** problemes serieux qui n'empechent pas de generer */
   warnings: string[];
 }
@@ -62,7 +63,10 @@ function label(r: ModResolution): string {
 }
 
 export function checkReadiness(
-  state: Pick<MergeState, "resolutions" | "conflicts" | "manualFiles" | "failedDownloads">,
+  state: Pick<
+    MergeState,
+    "resolutions" | "conflicts" | "pinnedConflicts" | "manualFiles" | "failedDownloads"
+  >,
   mode: ExportMode,
 ): Readiness {
   const missing: Blocker[] = state.resolutions
@@ -97,6 +101,17 @@ export function checkReadiness(
       detail: `${p.fileName} — le telechargement precedent a echoue`,
     }));
 
+  // Une version epinglee non respectee fait planter le jeu au chargement du
+  // monde : c'est pire qu'un fichier manquant, qui se voit tout de suite.
+  const version: Blocker[] = state.pinnedConflicts.map((c) => ({
+    kind: "version" as const,
+    key: `${c.dependentKey}->${c.dependencyKey}`,
+    name: `${c.dependentName} et ${c.dependencyName}`,
+    detail:
+      `${c.dependentName} ${c.dependentVersion} exige une autre version de ` +
+      `${c.dependencyName} que la ${c.installedVersion} retenue`,
+  }));
+
   const warnings: string[] = [];
   const durs = state.conflicts.filter((c) => c.severity === "hard");
   if (durs.length) {
@@ -116,13 +131,16 @@ export function checkReadiness(
     );
   }
 
-  const blockers = [...missing, ...manual, ...failed];
-  return { ready: blockers.length === 0, blockers, missing, manual, failed, warnings };
+  const blockers = [...version, ...missing, ...manual, ...failed];
+  return { ready: blockers.length === 0, blockers, missing, manual, failed, version, warnings };
 }
 
 /** Ce qui manque, en une phrase, pour un bouton ou un titre. */
 export function summarizeBlockers(r: Readiness): string {
   const bouts: string[] = [];
+  if (r.version.length) {
+    bouts.push(`${r.version.length} conflit(s) de version`);
+  }
   if (r.missing.length) {
     bouts.push(`${r.missing.length} sans version compatible`);
   }

@@ -6,3 +6,14 @@ out
 next-env.d.ts
 .DS_Store
 .wrangler
+
+# Modpacks, mods et resource packs de test deposes a la racine.
+# Ce sont des donnees d'essai, parfois de plusieurs centaines de Mo : elles
+# n'ont rien a faire dans le depot.
+/*.zip
+/*.mrpack
+/*.jar
+public/test
+
+# Variables locales (Next les charge en developpement)
+.env*.local

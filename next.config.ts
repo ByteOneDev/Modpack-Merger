@@ -20,6 +20,23 @@ const nextConfig: NextConfig = {
   trailingSlash: true,
   images: { unoptimized: true },
   reactStrictMode: true,
+
+  /**
+   * Relais CurseForge en developpement.
+   *
+   * Le Worker deploye ne renvoie d'en-tete CORS que pour sa propre origine :
+   * depuis `next dev`, CurseForge est donc injoignable et la moitie du
+   * catalogue devient invisible. Cette reecriture fait passer /api/ par le
+   * serveur de developpement, qui n'est pas soumis a la politique d'origine.
+   *
+   * Activee seulement si NEXT_PUBLIC_DEV_RELAY est renseignee, et ignoree a
+   * l'export statique : la production sert ces routes avec son propre Worker.
+   */
+  async rewrites() {
+    const relais = process.env.NEXT_PUBLIC_DEV_RELAY?.replace(/\/+$/, "");
+    if (process.env.NODE_ENV !== "development" || !relais) return [];
+    return [{ source: "/api/:chemin*", destination: `${relais}/api/:chemin*` }];
+  },
 };
 
 export default nextConfig;

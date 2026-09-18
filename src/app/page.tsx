@@ -26,9 +26,10 @@ const FORMAT_LABEL: Record<string, string> = {
 
 export default function PacksPage() {
   const router = useRouter();
-  const { state, setState, hydrated } = useMerge();
+  const { state, setState, hydrated, stockageIndisponible } = useMerge();
   const [busy, setBusy] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [stockageFragile, setStockageFragile] = React.useState(false);
   const [dragging, setDragging] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -49,7 +50,9 @@ export default function PacksPage() {
         const packId = crypto.randomUUID();
         // L'etiquette depend de la position finale : on la recalcule apres coup.
         const pack = await parsePack(buf, file.name, { packId, label: "?" });
-        await saveArchive(packId, file);
+        // Un echec d'ecriture ne doit pas coûter le pack : il reste utilisable
+        // pour la session, seule sa survie a un rechargement est perdue.
+        if (!(await saveArchive(packId, file))) setStockageFragile(true);
         setState((prev) => {
           const next = [...prev.packs, pack];
           return { ...prev, packs: relabel(next), analyzed: false };
@@ -102,6 +105,19 @@ export default function PacksPage() {
         title="Quels modpacks veux-tu fusionner ?"
         description="Ajoute au moins deux archives. Tout se passe dans ton navigateur : rien n'est envoye sur un serveur."
       />
+
+      {(stockageIndisponible || stockageFragile) && (
+        <Alert variant="warning" className="mb-6">
+          <TriangleAlert />
+          <AlertTitle>La memoire du navigateur ne repond pas</AlertTitle>
+          <AlertDescription>
+            L&apos;outil fonctionne normalement, mais ton avancement ne survivra pas a un
+            rechargement de la page : les archives devront etre rechargees. C&apos;est le cas en
+            navigation privee, quand un autre onglet de l&apos;app est ouvert, ou quand les packs
+            depassent le quota de stockage du navigateur.
+          </AlertDescription>
+        </Alert>
+      )}
 
       {error && (
         <Alert variant="destructive" className="mb-6">

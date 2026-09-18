@@ -4,6 +4,9 @@ import { providerOf } from "@/lib/core/providers";
 import { newerThanPicked, pickBestVersion } from "@/lib/core/merge/resolve";
 import { resolveDependencies } from "@/lib/core/merge/deps";
 import { detectFunctionalConflicts } from "@/lib/core/merge/functional";
+import {
+  detectPinnedConflicts, fetchPinnedVersion, type PinnedConflict,
+} from "@/lib/core/merge/pinned";
 import { estimateRam } from "@/lib/core/merge/ram";
 import {
   LOADER_COMPAT,
@@ -46,6 +49,9 @@ function withDerived(
     conflicts: settings.detectFunctionalConflicts
       ? detectFunctionalConflicts(resolutions)
       : [],
+    // Toujours calcule : une version epinglee non respectee ne degrade pas
+    // le pack, elle le fait planter au chargement.
+    pinnedConflicts: detectPinnedConflicts(resolutions),
     ram: state.target
       ? estimateRam(resolutions, state.target.minecraft, {
           hasShaders: state.packs.some((p) =>
@@ -402,6 +408,44 @@ export async function addSchematics(
     manualFiles,
     addedCount: added.length,
   };
+}
+
+/**
+ * Remplace une dependance par la version exacte que son dependant exige.
+ *
+ * C'est une retrogradation assumee : la version la plus recente n'est pas
+ * toujours celle qui fonctionne. Le rapport de fusion garde la raison.
+ */
+export async function alignPinnedVersion(
+  state: MergeState,
+  conflict: PinnedConflict,
+  settings: Settings,
+): Promise<Partial<MergeState> & { error?: string }> {
+  const version = await fetchPinnedVersion(conflict, state.resolutions);
+  if (!version) {
+    return { error: `Version ${conflict.requiredVersionId} introuvable sur la plateforme.` };
+  }
+
+  const resolutions = state.resolutions.map((r) =>
+    r.key === conflict.dependencyKey
+      ? {
+          ...r,
+          picked: version,
+          unstable: version.versionType !== "release",
+          newerAvailable: {
+            versionNumber: conflict.installedVersion,
+            versionType: "release",
+            datePublished: "",
+          },
+          reason:
+            `${version.versionNumber} — version exigee par ${conflict.dependentName} ` +
+            `${conflict.dependentVersion} (${conflict.installedVersion} etait plus recente ` +
+            "mais incompatible)",
+        }
+      : r,
+  );
+
+  return withDerived(state, resolutions, settings);
 }
 
 /** Garde un seul mod d'un groupe en conflit et ecarte les autres. */

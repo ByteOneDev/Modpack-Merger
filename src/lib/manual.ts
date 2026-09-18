@@ -95,6 +95,13 @@ export interface MatchResult {
   how: "empreinte" | "nom exact" | "nom approchant";
 }
 
+/** Fichier ecarte, avec la raison. */
+export interface MatchRejet {
+  fileName: string;
+  raison: "mauvaise version" | "sans correspondance";
+  attenduPour?: string;
+}
+
 /**
  * Rapproche des fichiers deposes des telechargements attendus.
  *
@@ -105,41 +112,57 @@ export interface MatchResult {
 export async function matchFiles(
   files: { name: string; bytes: Uint8Array }[],
   pending: PendingDownload[],
-): Promise<{ matched: MatchResult[]; unmatched: string[] }> {
+): Promise<{ matched: MatchResult[]; rejets: MatchRejet[] }> {
   const matched: MatchResult[] = [];
-  const unmatched: string[] = [];
+  const rejets: MatchRejet[] = [];
   const taken = new Set<string>();
 
-  const bySha = new Map<string, PendingDownload>();
-  for (const p of pending) if (p.expectedSha1) bySha.set(p.expectedSha1.toLowerCase(), p);
+  const parEmpreinte = new Map<string, PendingDownload>();
+  for (const p of pending) if (p.expectedSha1) parEmpreinte.set(p.expectedSha1.toLowerCase(), p);
+
+  /** Le fichier ressemble-t-il, par son nom, a ce qui est attendu ? */
+  const parLeNom = (file: { name: string }): PendingDownload | undefined => {
+    const lower = file.name.toLowerCase();
+    const exact = pending.find((p) => !taken.has(p.key) && p.fileName.toLowerCase() === lower);
+    if (exact) return exact;
+    const voulu = normalizeTitle(file.name.replace(/\.[a-z0-9]+$/i, ""));
+    if (voulu.length < 4) return undefined;
+    return pending.find(
+      (p) =>
+        !taken.has(p.key) &&
+        (normalizeTitle(p.fileName.replace(/\.[a-z0-9]+$/i, "")).includes(voulu) ||
+          voulu.includes(normalizeTitle(p.name))),
+    );
+  };
 
   for (const file of files) {
     const digest = sha1(file.bytes);
-    const lower = file.name.toLowerCase();
 
-    let hit = bySha.get(digest);
+    let hit = parEmpreinte.get(digest);
     let how: MatchResult["how"] = "empreinte";
 
     if (!hit || taken.has(hit.key)) {
-      hit = pending.find((p) => !taken.has(p.key) && p.fileName.toLowerCase() === lower);
-      how = "nom exact";
-    }
-    if (!hit) {
-      const wanted = normalizeTitle(file.name.replace(/\.[a-z0-9]+$/i, ""));
-      hit =
-        wanted.length >= 4
-          ? pending.find(
-              (p) =>
-                !taken.has(p.key) &&
-                (normalizeTitle(p.fileName.replace(/\.[a-z0-9]+$/i, "")).includes(wanted) ||
-                  wanted.includes(normalizeTitle(p.name))),
-            )
-          : undefined;
-      how = "nom approchant";
+      const candidat = parLeNom(file);
+      // Quand l'empreinte attendue est connue et qu'elle ne correspond pas,
+      // c'est que le fichier n'est pas la bonne version. L'accepter parce que
+      // son nom ressemble mettrait un jar NeoForge dans un pack Fabric : il
+      // s'installerait, et le jeu planterait au demarrage.
+      if (candidat?.expectedSha1) {
+        rejets.push({
+          fileName: file.name,
+          raison: "mauvaise version",
+          attenduPour: candidat.name,
+        });
+        continue;
+      }
+      hit = candidat;
+      how = candidat && candidat.fileName.toLowerCase() === file.name.toLowerCase()
+        ? "nom exact"
+        : "nom approchant";
     }
 
     if (!hit) {
-      unmatched.push(file.name);
+      rejets.push({ fileName: file.name, raison: "sans correspondance" });
       continue;
     }
 
@@ -157,7 +180,7 @@ export async function matchFiles(
     });
   }
 
-  return { matched, unmatched };
+  return { matched, rejets };
 }
 
 /* ------------------------------------------------------------------ */

@@ -402,6 +402,9 @@ function Choice({
   return (
     <button
       type="button"
+      // Meme raison qu'a l'etape cible : sans cet attribut, le choix n'est
+      // visible qu'a l'oeil.
+      aria-pressed={selected}
       onClick={onClick}
       className={cn(
         "rounded-lg border p-3 text-left transition-colors",

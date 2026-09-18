@@ -142,6 +142,9 @@ export default function TargetPage() {
                 <button
                   key={id}
                   type="button"
+                  // Le choix n'etait signale que par la bordure : un lecteur
+                  // d'ecran ne pouvait pas dire quel loader est retenu.
+                  aria-pressed={selected}
                   onClick={() => setTarget((t) => ({ ...t, loader: id }))}
                   className={cn(
                     "rounded-lg border p-3 text-left transition-colors",

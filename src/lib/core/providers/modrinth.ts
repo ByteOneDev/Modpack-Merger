@@ -175,6 +175,21 @@ export const modrinth = {
     return (res ?? []).map(toVersion);
   },
 
+  /**
+   * Une version precise, par son identifiant.
+   *
+   * Sert aux dependances epinglees : Iris ne demande pas « Sodium », il
+   * demande une version donnee de Sodium, parce que ses mixins visent la
+   * disposition interne de cette version-la.
+   */
+  async getVersionById(versionId: string): Promise<ProviderVersion | null> {
+    const v = await request<MrVersion>(`${API}/version/${versionId}`, {
+      provider: P,
+      nullOn404: true,
+    });
+    return v ? toVersion(v) : null;
+  },
+
   /** Identifie des fichiers a partir de leur sha1 (mods sans metadonnees). */
   async lookupByHashes(
     sha1s: string[],

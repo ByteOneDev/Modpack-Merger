@@ -1,4 +1,4 @@
-import { readZip, readJson, type ZipEntries } from "./zip";
+import { readZip, readJson, listZipEntries, type ZipEntries } from "./zip";
 import { sha1, curseforgeFingerprint } from "./hash";
 import { readJarMeta, nameFromFileName } from "./jarmeta";
 import { modrinth, curseforge } from "./providers";
@@ -38,9 +38,38 @@ interface CfManifest {
 }
 
 export function detectFormat(entries: ZipEntries): PackFormat {
-  if (entries["modrinth.index.json"]) return "mrpack";
-  if (entries["manifest.json"]) return "curseforge";
+  return detectFormatFromNames(Object.keys(entries));
+}
+
+export function detectFormatFromNames(names: Iterable<string>): PackFormat {
+  const set = names instanceof Set ? names : new Set(names);
+  if (set.has("modrinth.index.json")) return "mrpack";
+  if (set.has("manifest.json")) return "curseforge";
   return "raw";
+}
+
+/**
+ * Destination d'un fichier d'instance, ou null s'il n'en est pas un.
+ *
+ * Meme regle que extractOverrides, mais sur le seul nom : de quoi compter et
+ * reperer shaderpacks/ ou resourcepacks/ sans rien decompresser. Sur un pack
+ * qui embarque un monde sauvegarde, ouvrir chaque fichier pour lire son nom
+ * represente plusieurs centaines de Mo pour rien.
+ */
+function overridePathOf(path: string, format: PackFormat, rootPrefix: string): string | null {
+  if (format === "mrpack") {
+    return path.startsWith("overrides/") ||
+      path.startsWith("client-overrides/") ||
+      path.startsWith("server-overrides/")
+      ? path
+      : null;
+  }
+  if (format === "curseforge") {
+    return path.startsWith("overrides/") ? path : null;
+  }
+  if (/^.*mods\/[^/]+\.jar$/i.test(path)) return null;
+  const rel = path.slice(rootPrefix.length);
+  return rel ? `overrides/${rel}` : null;
 }
 
 function loaderFromMrDependencies(deps: Record<string, string>) {
@@ -119,14 +148,130 @@ export interface ParseOptions {
   label: string;
 }
 
+/** Jar pose dans un dossier mods/, a quelque niveau que ce soit. */
+function isLooseJar(path: string): boolean {
+  return /(^|\/)mods\/[^/]+\.jar$/i.test(path);
+}
+
+/**
+ * Identifie des jars par leur empreinte et les verse dans le pack.
+ *
+ * Un pack CurseForge ou Modrinth ne liste dans son manifeste que ce qui vient
+ * de la plateforme. Tout le reste — mods absents du catalogue, versions
+ * bricolees, jars recuperes a la main — est simplement depose dans
+ * overrides/mods/. Ces fichiers sont du contenu a part entiere : les traiter
+ * comme des fichiers de configuration les ferait passer a cote de la fusion,
+ * donc du choix de loader, de la deduplication et des mises a jour.
+ *
+ * Les jars sont decompresses par lots bornes puis relaches : sur un pack de
+ * 900 Mo, tout ouvrir d'un coup saturerait la memoire de l'onglet.
+ */
+async function identifyJars(
+  buf: Uint8Array,
+  paths: string[],
+  pack: ParsedPack,
+  opts: { deduireCible?: boolean } = {},
+): Promise<{ total: number; identifies: number }> {
+  if (!paths.length) return { total: 0, identifies: 0 };
+
+  const LOT_MAX = 64 * 1024 * 1024;
+  const tailles = new Map(listZipEntries(buf).map((e) => [e.path, e.size]));
+
+  const sha1s: string[] = [];
+  const fingerprints: number[] = [];
+  const staged: { mod: PackMod; fp: number }[] = [];
+
+  let lot: string[] = [];
+  let poids = 0;
+  const traiter = () => {
+    if (!lot.length) return;
+    const groupe = new Set(lot);
+    const entries = readZip(buf, (chemin) => groupe.has(chemin));
+    for (const chemin of lot) {
+      const data = entries[chemin];
+      if (!data) continue;
+      const fileName = chemin.split("/").pop()!;
+      const h1 = sha1(data);
+      const fp = curseforgeFingerprint(data);
+      const meta = readJarMeta(data);
+      sha1s.push(h1);
+      fingerprints.push(fp);
+      staged.push({
+        mod: {
+          key: nextKey(pack.label),
+          name: meta?.name ?? nameFromFileName(fileName),
+          kind: "mod",
+          provider: "unknown",
+          versionNumber: meta?.version,
+          path: `mods/${fileName}`,
+          fileName,
+          fileSize: data.length,
+          hashes: { sha1: h1, murmur2: String(fp) },
+          downloads: [],
+          env: { client: "unknown", server: "unknown" },
+          modId: meta?.modId,
+          required: true,
+          from: { kind: "pack", packId: pack.id },
+        },
+        fp,
+      });
+    }
+    lot = [];
+    poids = 0;
+  };
+
+  for (const chemin of paths) {
+    lot.push(chemin);
+    poids += tailles.get(chemin) ?? 0;
+    if (poids >= LOT_MAX) traiter();
+  }
+  traiter();
+
+  const [mrHits, cfHits] = await Promise.all([
+    modrinth.lookupByHashes(sha1s).catch(() => new Map()),
+    curseforge.lookupByFingerprints(fingerprints).catch(() => new Map()),
+  ]);
+
+  let identifies = 0;
+  for (const { mod, fp } of staged) {
+    const hit = (mod.hashes.sha1 ? mrHits.get(mod.hashes.sha1) : undefined) ?? cfHits.get(fp);
+    if (hit) {
+      identifies++;
+      mod.provider = hit.provider;
+      mod.projectId = hit.projectId;
+      mod.fileId = hit.versionId;
+      mod.versionNumber = hit.versionNumber;
+      if (opts.deduireCible) {
+        if (!pack.loader && hit.loaders.length) pack.loader = hit.loaders[0] as LoaderId;
+        if (!pack.minecraft && hit.gameVersions.length) pack.minecraft = hit.gameVersions[0];
+      }
+    }
+    pack.mods.push(mod);
+  }
+
+  await enrichModrinth(pack.mods);
+  return { total: staged.length, identifies };
+}
+
 export async function parsePack(
   buf: Uint8Array,
   fileName: string,
   opts: ParseOptions,
 ): Promise<ParsedPack> {
-  const entries = readZip(buf);
-  const format = detectFormat(entries);
+  // Rien n'est decompresse a ce stade : le catalogue suffit a connaitre le
+  // format et la liste des fichiers. Un pack qui embarque un monde
+  // sauvegarde depasse le Go une fois ouvert, pour une information qui tient
+  // dans ses noms de fichiers.
+  const catalogue = listZipEntries(buf);
+  const noms = catalogue.map((e) => e.path);
+  const format = detectFormatFromNames(noms);
   const warnings: string[] = [];
+
+  // Seul le manifeste est lu, et il pese quelques kilo-octets.
+  const entries = readZip(
+    buf,
+    (p) => p === "modrinth.index.json" || p === "manifest.json",
+  );
 
   const pack: ParsedPack = {
     id: opts.packId,
@@ -141,15 +286,51 @@ export async function parsePack(
     fileSize: buf.length,
   };
 
-  if (format === "mrpack") await parseMrpack(entries, pack, warnings);
-  else if (format === "curseforge") await parseCurseforge(entries, pack, warnings);
-  else await parseRaw(entries, pack, warnings);
+  const tousLesJars = noms.filter((p) => /\.jar$/i.test(p));
+
+  let manifesteLu = true;
+  if (format === "mrpack") manifesteLu = await parseMrpack(entries, pack, warnings);
+  else if (format === "curseforge") manifesteLu = await parseCurseforge(entries, pack, warnings);
+
+  if (format === "raw" || !manifesteLu) {
+    if (!tousLesJars.length) {
+      warnings.push("Aucun .jar trouve : archive ignoree.");
+    } else {
+      const { total, identifies } = await identifyJars(buf, tousLesJars, pack, {
+        deduireCible: true,
+      });
+      const inconnus = total - identifies;
+      if (inconnus > 0) {
+        warnings.push(
+          `${inconnus} mod(s) sur ${total} non identifies par leur empreinte ` +
+            "(jars modifies ou non publies). Ils seront copies tels quels.",
+        );
+      }
+    }
+  } else {
+    // Jars poses dans mods/ sans figurer au manifeste : ils ne doivent pas
+    // etre traites comme de simples fichiers d'instance, sans quoi ils
+    // echappent entierement a la fusion.
+    const horsManifeste = tousLesJars.filter(isLooseJar);
+    const { total, identifies } = await identifyJars(buf, horsManifeste, pack);
+    if (total) {
+      const inconnus = total - identifies;
+      warnings.push(
+        `${total} mod(s) etaient poses dans mods/ sans figurer au manifeste` +
+          (inconnus ? `, dont ${inconnus} non identifie(s) par leur empreinte` : "") +
+          ". Ils participent a la fusion comme les autres.",
+      );
+    }
+  }
 
   // La racine se lit sur l'archive complete : les relectures suivantes
   // sautent les jars pour economiser la memoire et ne pourraient plus la
   // deduire.
-  pack.rootPrefix = format === "raw" ? commonPrefix(Object.keys(entries)) : "";
-  pack.overridePaths = Object.keys(extractOverrides(entries, pack));
+  const brut = format === "raw" || !manifesteLu;
+  pack.rootPrefix = brut ? commonPrefix(noms) : "";
+  pack.overridePaths = noms
+    .map((n) => overridePathOf(n, brut ? "raw" : format, pack.rootPrefix ?? ""))
+    .filter((n): n is string => n !== null);
 
   if (!pack.loader) {
     warnings.push("Mod loader non detecte : il sera deduit des mods eux-memes.");
@@ -159,11 +340,16 @@ export async function parsePack(
   return pack;
 }
 
-async function parseMrpack(entries: ZipEntries, pack: ParsedPack, warnings: string[]) {
+/** @returns false si le manifeste est illisible : le pack est alors lu en mode brut. */
+async function parseMrpack(
+  entries: ZipEntries,
+  pack: ParsedPack,
+  warnings: string[],
+): Promise<boolean> {
   const index = readJson<MrIndex>(entries, "modrinth.index.json");
   if (!index) {
     warnings.push("modrinth.index.json illisible, lecture en mode brut.");
-    return parseRaw(entries, pack, warnings);
+    return false;
   }
 
   pack.name = index.name || pack.name;
@@ -200,13 +386,19 @@ async function parseMrpack(entries: ZipEntries, pack: ParsedPack, warnings: stri
   }
 
   await enrichModrinth(pack.mods);
+  return true;
 }
 
-async function parseCurseforge(entries: ZipEntries, pack: ParsedPack, warnings: string[]) {
+/** @returns false si le manifeste est illisible : le pack est alors lu en mode brut. */
+async function parseCurseforge(
+  entries: ZipEntries,
+  pack: ParsedPack,
+  warnings: string[],
+): Promise<boolean> {
   const manifest = readJson<CfManifest>(entries, "manifest.json");
   if (!manifest) {
     warnings.push("manifest.json illisible, lecture en mode brut.");
-    return parseRaw(entries, pack, warnings);
+    return false;
   }
 
   pack.name = manifest.name || pack.name;
@@ -252,80 +444,7 @@ async function parseCurseforge(entries: ZipEntries, pack: ParsedPack, warnings: 
   }
 
   if (hasProxy) await enrichCurseforge(pack.mods);
-}
-
-async function parseRaw(entries: ZipEntries, pack: ParsedPack, warnings: string[]) {
-  const jarPaths = Object.keys(entries).filter((p) => /\.jar$/i.test(p));
-  if (!jarPaths.length) {
-    warnings.push("Aucun .jar trouve : archive ignoree.");
-    return;
-  }
-
-  const prefix = commonPrefix(Object.keys(entries));
-  const sha1s: string[] = [];
-  const fingerprints: number[] = [];
-  const staged: { mod: PackMod; fp: number }[] = [];
-
-  for (const p of jarPaths) {
-    const data = entries[p];
-    const rel = p.slice(prefix.length);
-    const fileName = p.split("/").pop()!;
-    const h1 = sha1(data);
-    const fp = curseforgeFingerprint(data);
-    const meta = readJarMeta(data);
-
-    sha1s.push(h1);
-    fingerprints.push(fp);
-    staged.push({
-      mod: {
-        key: nextKey(pack.label),
-        name: meta?.name ?? nameFromFileName(fileName),
-        kind: "mod",
-        provider: "unknown",
-        versionNumber: meta?.version,
-        path: rel.startsWith("mods/") ? rel : `mods/${fileName}`,
-        fileName,
-        fileSize: data.length,
-        hashes: { sha1: h1, murmur2: String(fp) },
-        downloads: [],
-        env: { client: "unknown", server: "unknown" },
-        modId: meta?.modId,
-        required: true,
-        from: { kind: "pack", packId: pack.id },
-      },
-      fp,
-    });
-  }
-
-  const [mrHits, cfHits] = await Promise.all([
-    modrinth.lookupByHashes(sha1s).catch(() => new Map()),
-    curseforge.lookupByFingerprints(fingerprints).catch(() => new Map()),
-  ]);
-
-  let identified = 0;
-  for (const { mod, fp } of staged) {
-    const hit = (mod.hashes.sha1 ? mrHits.get(mod.hashes.sha1) : undefined) ?? cfHits.get(fp);
-    if (hit) {
-      identified++;
-      mod.provider = hit.provider;
-      mod.projectId = hit.projectId;
-      mod.fileId = hit.versionId;
-      mod.versionNumber = hit.versionNumber;
-      if (!pack.loader && hit.loaders.length) pack.loader = hit.loaders[0] as LoaderId;
-      if (!pack.minecraft && hit.gameVersions.length) pack.minecraft = hit.gameVersions[0];
-    }
-    pack.mods.push(mod);
-  }
-
-  await enrichModrinth(pack.mods);
-
-  const unknown = pack.mods.length - identified;
-  if (unknown > 0) {
-    warnings.push(
-      `${unknown} mod(s) sur ${pack.mods.length} non identifies par leur empreinte ` +
-        "(jars modifies ou non publies). Ils seront copies tels quels.",
-    );
-  }
+  return true;
 }
 
 /**

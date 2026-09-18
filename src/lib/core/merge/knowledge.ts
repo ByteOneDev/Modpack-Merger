@@ -25,6 +25,34 @@ export interface Equivalence {
 
 export const EQUIVALENCES: Equivalence[] = [
   {
+    id: "schematiques",
+    label: "Schematiques",
+    identity: ["litematica", "forgematica", "schematica"],
+    prefer: {
+      fabric: ["litematica"],
+      quilt: ["litematica"],
+      neoforge: ["forgematica"],
+      forge: ["forgematica"],
+    },
+    why:
+      "Litematica est un mod Fabric. Forgematica en est le portage pour Forge et " +
+      "NeoForge : meme interface, memes fichiers .litematic.",
+  },
+  {
+    id: "malilib",
+    label: "Bibliotheque malilib",
+    identity: ["malilib", "mafglib"],
+    prefer: {
+      fabric: ["malilib"],
+      quilt: ["malilib"],
+      neoforge: ["mafglib"],
+      forge: ["mafglib"],
+    },
+    why:
+      "MaLiLib est la bibliotheque des mods de masa, disponible sur Fabric. MaFgLib " +
+      "en est le portage Forge et NeoForge, exige par Forgematica.",
+  },
+  {
     id: "item-viewer",
     label: "Visualiseur de recettes",
     identity: ["jei", "roughly-enough-items", "rei", "emi", "just-enough-items"],
