@@ -17,7 +17,9 @@ import { ExportGate } from "@/components/export-gate";
 import { ManualDownloads } from "@/components/manual-downloads";
 import { useMerge } from "@/lib/store";
 import { readPackFiles } from "@/lib/analyze";
-import { buildPack, IncompletePack, type BuildReport, type ExportFormat } from "@/lib/core/build";
+import {
+  buildPack, IncompletePack, packFileName, type BuildReport, type ExportFormat,
+} from "@/lib/core/build";
 import { checkReadiness, summarizeBlockers } from "@/lib/readiness";
 import { excludeMany } from "@/lib/actions";
 import { buildSummary } from "@/lib/core/summary";
@@ -31,8 +33,13 @@ export default function ExportPage() {
   const router = useRouter();
   const { state, setState, settings, hydrated } = useMerge();
 
-  const [format, setFormat] = React.useState<ExportFormat>(settings.defaultExportFormat);
-  const [bundleJars, setBundleJars] = React.useState(settings.defaultBundleJars);
+  // null tant que l'utilisateur n'a rien choisi : les reglages sont relus
+  // apres le premier rendu, un etat initialise d'emblee ignorait donc les
+  // valeurs par defaut choisies dans les reglages.
+  const [formatChoisi, setFormat] = React.useState<ExportFormat | null>(null);
+  const [bundleChoisi, setBundleJars] = React.useState<boolean | null>(null);
+  const format = formatChoisi ?? settings.defaultExportFormat;
+  const bundleJars = bundleChoisi ?? settings.defaultBundleJars;
   const [progress, setProgress] = React.useState<{ step: string; done: number; total: number } | null>(null);
   const [report, setReport] = React.useState<BuildReport | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -68,13 +75,18 @@ export default function ExportPage() {
     setReport(null);
     setProgress({ step: "Preparation", done: 0, total: 1 });
     try {
+      // Le choix du fichier passe avant toute lecture : le navigateur n'ouvre
+      // la fenetre que dans la foulee du clic. Relire d'abord des archives de
+      // plusieurs centaines de Mo depassait ce delai, la fenetre etait
+      // refusee et l'export retombait en silence sur un Blob en memoire.
+      const destination =
+        bundleJars && canStreamToDisk()
+          ? await askWhereToSave(packFileName(target, format))
+          : null;
+      if (destination === "cancelled") return;
+
       const packFiles = await readPackFiles(state.packs);
       const manualFiles = await loadManualFiles(Object.keys(state.manualFiles));
-
-      // Nom propose avant generation : le choix du fichier doit suivre le
-      // clic de l'utilisateur, sinon le navigateur refuse d'ouvrir la fenetre.
-      const suggested = suggestedFileName(target, format);
-      const destination = bundleJars && canStreamToDisk() ? await askWhereToSave(suggested) : null;
 
       const built = await buildPack({
         target,
@@ -370,20 +382,6 @@ export default function ExportPage() {
       )}
     </>
   );
-}
-
-/**
- * Nom propose dans la fenetre d'enregistrement. Le builder recalcule le nom
- * definitif ; ici il s'agit seulement de pre-remplir le champ.
- */
-function suggestedFileName(target: { name: string; version: string }, format: ExportFormat) {
-  const safe =
-    target.name
-      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .replace(/ /g, "-") || "modpack";
-  return `${safe}-${target.version}.${format === "mrpack" ? "mrpack" : "zip"}`;
 }
 
 function Choice({

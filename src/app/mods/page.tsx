@@ -115,7 +115,7 @@ export default function ModsPage() {
           return patch;
         }}
         onDropDependent={(key) =>
-          setState((prev) => ({ ...prev, ...excludeMod(state, key, settings) }))
+          setState((prev) => ({ ...prev, ...excludeMod(prev, key, settings) }))
         }
       />
 
@@ -178,7 +178,7 @@ export default function ModsPage() {
                           setOpenAlt(null);
                         }}
                         onGiveUp={() => {
-                          setState((prev) => ({ ...prev, ...excludeMod(state, r.key, settings) }));
+                          setState((prev) => ({ ...prev, ...excludeMod(prev, r.key, settings) }));
                           setOpenAlt(null);
                         }}
                       />
@@ -226,7 +226,7 @@ export default function ModsPage() {
                         setState((prev) => ({
                           ...prev,
                           ...resolveConflict(
-                            state,
+                            prev,
                             m.key,
                             c.members.map((x) => x.key),
                             settings,
@@ -299,7 +299,7 @@ export default function ModsPage() {
                     size="icon-sm"
                     aria-label="Ecarter"
                     onClick={() =>
-                      setState((prev) => ({ ...prev, ...excludeMod(state, r.key, settings) }))
+                      setState((prev) => ({ ...prev, ...excludeMod(prev, r.key, settings) }))
                     }
                   >
                     <Trash2 />
@@ -318,7 +318,7 @@ export default function ModsPage() {
                     size="icon-sm"
                     aria-label="Ecarter"
                     onClick={() =>
-                      setState((prev) => ({ ...prev, ...excludeMod(state, r.key, settings) }))
+                      setState((prev) => ({ ...prev, ...excludeMod(prev, r.key, settings) }))
                     }
                   >
                     <Trash2 />
@@ -337,7 +337,7 @@ export default function ModsPage() {
                     size="icon-sm"
                     aria-label="Remettre"
                     onClick={() =>
-                      setState((prev) => ({ ...prev, ...restoreMod(state, r.key, settings) }))
+                      setState((prev) => ({ ...prev, ...restoreMod(prev, r.key, settings) }))
                     }
                   >
                     <RotateCcw />

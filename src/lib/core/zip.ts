@@ -61,6 +61,93 @@ export interface ZipSurvey {
   ratio: number;
 }
 
+interface CatalogEntry {
+  name: Uint8Array;
+  compressed: number;
+  uncompressed: number;
+}
+
+/** Position du catalogue central et nombre d'entrees annonce. */
+function locateCatalog(dv: DataView): { count: number; offset: number } | null {
+  // Le End Of Central Directory est en fin de fichier, apres un commentaire
+  // de longueur variable : on le cherche a rebours sur 64 Ko au plus.
+  const scanFrom = Math.max(0, dv.byteLength - 65_557);
+  let eocd = -1;
+  for (let i = dv.byteLength - 22; i >= scanFrom; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd === -1) return null;
+
+  let count = dv.getUint16(eocd + 10, true);
+  let offset = dv.getUint32(eocd + 16, true);
+
+  // Zip64 : les champs 32 bits saturent a 0xFFFF / 0xFFFFFFFF et la vraie
+  // valeur vit dans un enregistrement separe.
+  if (count === 0xffff || offset === 0xffffffff) {
+    const locator = eocd - 20;
+    if (locator >= 0 && dv.getUint32(locator, true) === 0x07064b50) {
+      const z64 = Number(dv.getBigUint64(locator + 8, true));
+      if (z64 >= 0 && z64 + 56 <= dv.byteLength && dv.getUint32(z64, true) === 0x06064b50) {
+        count = Number(dv.getBigUint64(z64 + 32, true));
+        offset = Number(dv.getBigUint64(z64 + 48, true));
+      }
+    }
+  }
+  return { count, offset };
+}
+
+/**
+ * Parcourt le catalogue central sans rien decompresser.
+ *
+ * Les tailles saturees a 0xFFFFFFFF sont relues dans le champ extra Zip64 :
+ * sans cela, une seule entree Zip64 comptait pour 4 Go et faisait refuser
+ * l'archive entiere comme bombe de decompression.
+ */
+function* walkCatalog(
+  buf: Uint8Array,
+  dv: DataView,
+  catalog: { count: number; offset: number },
+): Generator<CatalogEntry> {
+  let p = catalog.offset;
+  for (let i = 0; i < catalog.count && p + 46 <= buf.length; i++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    let compressed = dv.getUint32(p + 20, true);
+    let uncompressed = dv.getUint32(p + 24, true);
+    const nameLen = dv.getUint16(p + 28, true);
+    const extraLen = dv.getUint16(p + 30, true);
+    const commentLen = dv.getUint16(p + 32, true);
+
+    if (compressed === 0xffffffff || uncompressed === 0xffffffff) {
+      // Seuls les champs satures figurent, dans l'ordre : decompressee, puis
+      // compressee.
+      let e = p + 46 + nameLen;
+      const fin = Math.min(e + extraLen, buf.length);
+      while (e + 4 <= fin) {
+        const id = dv.getUint16(e, true);
+        const size = dv.getUint16(e + 2, true);
+        if (id === 0x0001) {
+          let q = e + 4;
+          if (uncompressed === 0xffffffff && q + 8 <= fin) {
+            uncompressed = Number(dv.getBigUint64(q, true));
+            q += 8;
+          }
+          if (compressed === 0xffffffff && q + 8 <= fin) {
+            compressed = Number(dv.getBigUint64(q, true));
+          }
+          break;
+        }
+        e += 4 + size;
+      }
+    }
+
+    yield { name: buf.subarray(p + 46, p + 46 + nameLen), compressed, uncompressed };
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+}
+
 /**
  * Inspecte le catalogue central de l'archive sans rien decompresser.
  *
@@ -70,34 +157,9 @@ export interface ZipSurvey {
  */
 export function surveyZip(buf: Uint8Array): ZipSurvey {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-
-  // Le End Of Central Directory est en fin de fichier, apres un commentaire
-  // de longueur variable : on le cherche a rebours sur 64 Ko au plus.
-  const scanFrom = Math.max(0, buf.length - 65_557);
-  let eocd = -1;
-  for (let i = buf.length - 22; i >= scanFrom; i--) {
-    if (dv.getUint32(i, true) === 0x06054b50) {
-      eocd = i;
-      break;
-    }
-  }
-  if (eocd === -1) throw new ZipRejected("Archive illisible : catalogue introuvable.");
-
-  let entryCount = dv.getUint16(eocd + 10, true);
-  let cdOffset = dv.getUint32(eocd + 16, true);
-
-  // Zip64 : les champs 32 bits saturent a 0xFFFF / 0xFFFFFFFF et la vraie
-  // valeur vit dans un enregistrement separe.
-  if (entryCount === 0xffff || cdOffset === 0xffffffff) {
-    const locator = eocd - 20;
-    if (locator >= 0 && dv.getUint32(locator, true) === 0x07064b50) {
-      const z64 = Number(dv.getBigUint64(locator + 8, true));
-      if (z64 >= 0 && z64 + 56 <= buf.length && dv.getUint32(z64, true) === 0x06064b50) {
-        entryCount = Number(dv.getBigUint64(z64 + 32, true));
-        cdOffset = Number(dv.getBigUint64(z64 + 48, true));
-      }
-    }
-  }
+  const catalog = locateCatalog(dv);
+  if (!catalog) throw new ZipRejected("Archive illisible : catalogue introuvable.");
+  const entryCount = catalog.count;
 
   if (entryCount > ZIP_LIMITS.maxEntries) {
     throw new ZipRejected(
@@ -107,17 +169,9 @@ export function surveyZip(buf: Uint8Array): ZipSurvey {
 
   let compressed = 0;
   let uncompressed = 0;
-  let p = cdOffset;
-
-  for (let i = 0; i < entryCount && p + 46 <= buf.length; i++) {
-    if (dv.getUint32(p, true) !== 0x02014b50) break;
-    compressed += dv.getUint32(p + 20, true);
-    uncompressed += dv.getUint32(p + 24, true);
-    const nameLen = dv.getUint16(p + 28, true);
-    const extraLen = dv.getUint16(p + 30, true);
-    const commentLen = dv.getUint16(p + 32, true);
-    p += 46 + nameLen + extraLen + commentLen;
-
+  for (const e of walkCatalog(buf, dv, catalog)) {
+    compressed += e.compressed;
+    uncompressed += e.uncompressed;
     if (uncompressed > ZIP_LIMITS.maxUncompressedBytes) {
       throw new ZipRejected(
         "Archive refusee : son contenu decompresse depasse 8 Go. " +
@@ -142,11 +196,6 @@ export function surveyZip(buf: Uint8Array): ZipSurvey {
   };
 }
 
-/**
- * @param keep filtre applique *avant* decompression. Sauter les jars quand on
- *   ne veut que les fichiers de configuration evite de charger plusieurs Go
- *   en memoire pour rien.
- */
 export interface ZipEntryInfo {
   path: string;
   /** taille une fois decompressee */
@@ -162,44 +211,23 @@ export interface ZipEntryInfo {
  */
 export function listZipEntries(buf: Uint8Array): ZipEntryInfo[] {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const scanFrom = Math.max(0, buf.length - 65_557);
-  let eocd = -1;
-  for (let i = buf.length - 22; i >= scanFrom; i--) {
-    if (dv.getUint32(i, true) === 0x06054b50) {
-      eocd = i;
-      break;
-    }
-  }
-  if (eocd === -1) return [];
-
-  let count = dv.getUint16(eocd + 10, true);
-  let p = dv.getUint32(eocd + 16, true);
-  if (count === 0xffff || p === 0xffffffff) {
-    const locator = eocd - 20;
-    if (locator >= 0 && dv.getUint32(locator, true) === 0x07064b50) {
-      const z64 = Number(dv.getBigUint64(locator + 8, true));
-      if (z64 >= 0 && z64 + 56 <= buf.length && dv.getUint32(z64, true) === 0x06064b50) {
-        count = Number(dv.getBigUint64(z64 + 32, true));
-        p = Number(dv.getBigUint64(z64 + 48, true));
-      }
-    }
-  }
+  const catalog = locateCatalog(dv);
+  if (!catalog) return [];
 
   const dec = new TextDecoder();
   const out: ZipEntryInfo[] = [];
-  for (let i = 0; i < count && p + 46 <= buf.length; i++) {
-    if (dv.getUint32(p, true) !== 0x02014b50) break;
-    const size = dv.getUint32(p + 24, true);
-    const nameLen = dv.getUint16(p + 28, true);
-    const extraLen = dv.getUint16(p + 30, true);
-    const commentLen = dv.getUint16(p + 32, true);
-    const path = normalizePath(dec.decode(buf.subarray(p + 46, p + 46 + nameLen)));
-    if (!path.endsWith("/") && isSafePath(path)) out.push({ path, size });
-    p += 46 + nameLen + extraLen + commentLen;
+  for (const e of walkCatalog(buf, dv, catalog)) {
+    const path = normalizePath(dec.decode(e.name));
+    if (!path.endsWith("/") && isSafePath(path)) out.push({ path, size: e.uncompressed });
   }
   return out;
 }
 
+/**
+ * @param keep filtre applique *avant* decompression. Sauter les jars quand on
+ *   ne veut que les fichiers de configuration evite de charger plusieurs Go
+ *   en memoire pour rien.
+ */
 export function readZip(buf: Uint8Array, keep?: (path: string) => boolean): ZipEntries {
   if (buf.length > ZIP_LIMITS.maxArchiveBytes) {
     throw new ZipRejected("Archive refusee : plus de 4 Go.");
@@ -545,7 +573,7 @@ export function readJson<T>(entries: ZipEntries, path: string): T | null {
   if (text === null) return null;
   try {
     // certains packs sont sauvegardes en UTF-8 avec BOM
-    return JSON.parse(text.replace(/^﻿/, "")) as T;
+    return JSON.parse(text.replace(/^\uFEFF/, "")) as T;
   } catch {
     return null;
   }

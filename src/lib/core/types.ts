@@ -171,6 +171,11 @@ export interface ModResolution {
   newerAvailable?: { versionNumber: string; versionType: string; datePublished: string };
   /** fichier fourni a la main par l'utilisateur (voir lib/manual.ts) */
   manualFile?: { fileName: string; size: number; sha1: string };
+  /**
+   * Etat avant une exclusion manuelle, pour pouvoir la defaire : sans lui,
+   * « Remettre » ne retrouvait ni la version retenue ni la substitution.
+   */
+  beforeExclusion?: { status: ResolutionStatus; picked?: ProviderVersion; reason: string };
 }
 
 export interface Alternative {

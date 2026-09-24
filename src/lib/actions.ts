@@ -71,11 +71,21 @@ export function excludeMod(
   settings: Settings,
 ): Partial<MergeState> {
   const resolutions = state.resolutions.map((r) =>
-    r.key === key
-      ? { ...r, status: "excluded" as const, picked: undefined, reason: "Ecarte manuellement." }
-      : r,
+    r.key === key ? exclude(r, "Ecarte manuellement.") : r,
   );
   return withDerived(state, resolutions, settings);
+}
+
+/** Ecarte un element en gardant de quoi le remettre tel qu'il etait. */
+function exclude(r: ModResolution, reason: string): ModResolution {
+  if (r.status === "excluded") return r;
+  return {
+    ...r,
+    status: "excluded",
+    picked: undefined,
+    reason,
+    beforeExclusion: { status: r.status, picked: r.picked, reason: r.reason },
+  };
 }
 
 /**
@@ -93,9 +103,7 @@ export function excludeMany(
 ): Partial<MergeState> {
   const cibles = new Set(keys);
   const resolutions = state.resolutions.map((r) =>
-    cibles.has(r.key)
-      ? { ...r, status: "excluded" as const, picked: undefined, reason: raison }
-      : r,
+    cibles.has(r.key) ? exclude(r, raison) : r,
   );
   return {
     ...withDerived(state, resolutions, settings),
@@ -109,8 +117,18 @@ export function restoreMod(
   key: string,
   settings: Settings,
 ): Partial<MergeState> {
-  const resolutions = state.resolutions.map((r) => {
+  const resolutions = state.resolutions.map((r): ModResolution => {
     if (r.key !== key) return r;
+    const before = r.beforeExclusion;
+    if (before?.picked && (before.status === "ok" || before.status === "substituted")) {
+      return {
+        ...r,
+        status: before.status,
+        picked: before.picked,
+        reason: before.reason,
+        beforeExclusion: undefined,
+      };
+    }
     if (!r.picked) {
       return { ...r, status: "missing" as const, reason: "Remis dans la liste, sans version trouvee." };
     }
@@ -458,14 +476,7 @@ export function resolveConflict(
   const drop = new Set(memberKeys.filter((k) => k !== keepKey));
   const keeper = state.resolutions.find((r) => r.key === keepKey);
   const resolutions = state.resolutions.map((r) =>
-    drop.has(r.key)
-      ? {
-          ...r,
-          status: "excluded" as const,
-          picked: undefined,
-          reason: `Ecarte au profit de ${keeper?.name ?? "l'autre mod"}.`,
-        }
-      : r,
+    drop.has(r.key) ? exclude(r, `Ecarte au profit de ${keeper?.name ?? "l'autre mod"}.`) : r,
   );
   return withDerived(state, resolutions, settings);
 }

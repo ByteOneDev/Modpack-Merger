@@ -15,9 +15,15 @@ async function get(url: string, json = true): Promise<unknown> {
   return json ? res.json() : res.text();
 }
 
-/** NeoForge indexe ses versions sur la version de Minecraft sans le "1." initial. */
+/**
+ * NeoForge indexe ses versions sur la version de Minecraft sans le "1."
+ * initial, correctif compris : 1.21.1 -> 21.1, et 1.21 -> 21.0. Sans ce ".0",
+ * "21." attrapait aussi les versions de 1.21.1 a 1.21.x, et c'est la plus
+ * recente d'entre elles qui etait proposee pour un pack 1.21.
+ */
 function neoforgePrefix(mc: string): string {
-  return mc.startsWith("1.") ? mc.slice(2) : mc;
+  const v = mc.startsWith("1.") ? mc.slice(2) : mc;
+  return v.includes(".") ? v : `${v}.0`;
 }
 
 async function fetchLoaderVersion(

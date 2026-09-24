@@ -81,8 +81,9 @@ export async function request<T>(
         if (res.status === 404 && opts.nullOn404) return null;
 
         if (res.status === 429) {
+          lastErr = new ProviderError(`${opts.provider} limite le debit (429).`, 429, opts.provider);
           const retryAfter = Number(res.headers.get("retry-after") ?? "2");
-          await sleep(Math.min(retryAfter * 1000, 10_000));
+          await sleep(Math.min((Number.isFinite(retryAfter) ? retryAfter : 2) * 1000, 10_000));
           continue;
         }
 

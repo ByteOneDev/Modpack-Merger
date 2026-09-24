@@ -39,11 +39,15 @@ export function canStreamToDisk(): boolean {
 
 /**
  * Demande ou ecrire, puis renvoie de quoi y ecrire en flux.
- * Renvoie null si l'utilisateur annule ou si le navigateur ne sait pas faire.
+ *
+ * Renvoie "cancelled" si l'utilisateur ferme la fenetre : il ne veut pas du
+ * fichier, generer quand meme et le telecharger ailleurs serait un contresens.
+ * Renvoie null si le navigateur ne sait pas faire ou refuse d'ouvrir la
+ * fenetre : l'appelant se replie alors sur un Blob.
  */
 export async function askWhereToSave(
   suggestedName: string,
-): Promise<{ sink: ZipSink; name: string } | null> {
+): Promise<{ sink: ZipSink; name: string } | "cancelled" | null> {
   const w = window as SaveWindow;
   if (!w.showSaveFilePicker) return null;
 
@@ -59,8 +63,8 @@ export async function askWhereToSave(
         },
       ],
     });
-  } catch {
-    return null; // annulation
+  } catch (err) {
+    return err instanceof DOMException && err.name === "AbortError" ? "cancelled" : null;
   }
 
   const writable = await handle.createWritable();

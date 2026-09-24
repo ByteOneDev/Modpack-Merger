@@ -340,7 +340,9 @@ export const curseforge = {
       pageSize: String(limit),
     });
     if (gameVersion) qs.set("gameVersion", gameVersion);
-    const lt = kind === "mod" ? LOADER_TYPE[loaders[0] ?? ""] : undefined;
+    // Un seul type de loader par requete : pour Quilt, qui charge aussi les
+    // mods Fabric, filtrer sur Quilt seul ecartait presque tout le catalogue.
+    const lt = kind === "mod" && loaders.length === 1 ? LOADER_TYPE[loaders[0]] : undefined;
     if (lt) qs.set("modLoaderType", String(lt));
     const res = await cf<CfMod[]>(`/v1/mods/search?${qs}`);
     return (res ?? []).map(toProject);

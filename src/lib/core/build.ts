@@ -278,14 +278,12 @@ export async function buildPack(opts: BuildOptions): Promise<{
 
   for (const [path, sides] of byPath) {
     if (sides.length === 1 || sides.every((s) => bytesEqual(s.data, sides[0].data))) {
-      write(outPath(path), sides[0].data);
-      overridesWritten++;
+      if (write(outPath(path), sides[0].data)) overridesWritten++;
       continue;
     }
     const decision = opts.decisions[path] ?? sides[0].packId;
     for (const file of applyDecision(path, sides, decision)) {
-      write(outPath(file.path), file.data);
-      overridesWritten++;
+      if (write(outPath(file.path), file.data)) overridesWritten++;
     }
     conflictsResolved++;
   }
@@ -415,14 +413,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
     );
   }
 
-  const safeName =
-    target.name
-      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .replace(/ /g, "-") || "modpack";
-
-  let fileName: string;
+  const fileName = packFileName(target, format);
 
   if (format === "mrpack") {
     const dependencies: Record<string, string> = { minecraft: target.minecraft };
@@ -443,14 +434,17 @@ export async function buildPack(opts: BuildOptions): Promise<{
         2,
       ),
     ));
-    fileName = `${safeName}-${target.version}.mrpack`;
   } else {
     write("manifest.json", toU8(
       JSON.stringify(
         {
           minecraft: {
             version: target.minecraft,
-            modLoaders: [{ id: `${target.loader}-${loaderVersion}`, primary: true }],
+            // "forge-" sans numero n'est pas un identifiant valide : mieux
+            // vaut une liste vide, que le lanceur signale clairement.
+            modLoaders: loaderVersion
+              ? [{ id: `${target.loader}-${loaderVersion}`, primary: true }]
+              : [],
           },
           manifestType: "minecraftModpack",
           manifestVersion: 1,
@@ -472,7 +466,6 @@ export async function buildPack(opts: BuildOptions): Promise<{
           "automatiques par le lanceur.",
       );
     }
-    fileName = `${safeName}-${target.version}.zip`;
   }
 
   const ram =
@@ -528,6 +521,21 @@ export async function buildPack(opts: BuildOptions): Promise<{
   };
 }
 
+/** Nom de fichier sur : le nom et la version du pack sont saisis librement. */
+export function packFileName(
+  target: Pick<MergeTarget, "name" | "version">,
+  format: ExportFormat,
+): string {
+  const safe = (v: string) =>
+    v
+      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/ /g, "-");
+  const version = safe(target.version);
+  return `${safe(target.name) || "modpack"}${version ? `-${version}` : ""}.${format === "mrpack" ? "mrpack" : "zip"}`;
+}
+
 function envValue(v: string | undefined): string {
   return v === "unsupported" || v === "optional" || v === "required" ? v : "required";
 }
@@ -536,10 +544,15 @@ function buildModlistHtml(kept: ModResolution[], target: MergeTarget): string {
   const rows = kept
     .map(
       (r) =>
-        `<li><a href="${r.project?.url ?? "#"}">${escapeHtml(r.name)}</a> — ${escapeHtml(r.picked?.versionNumber ?? "")}</li>`,
+        `<li><a href="${escapeHtml(safeUrl(r.project?.url))}">${escapeHtml(r.name)}</a> — ${escapeHtml(r.picked?.versionNumber ?? "")}</li>`,
     )
     .join("\n");
   return `<html><head><meta charset="utf-8"><title>${escapeHtml(target.name)}</title></head><body><h1>${escapeHtml(target.name)}</h1><ul>\n${rows}\n</ul></body></html>`;
+}
+
+/** Seuls les liens http(s) sont repris : l'URL vient d'une reponse d'API. */
+function safeUrl(url: string | undefined): string {
+  return url && /^https?:\/\//i.test(url) ? url : "#";
 }
 
 function escapeHtml(s: string): string {

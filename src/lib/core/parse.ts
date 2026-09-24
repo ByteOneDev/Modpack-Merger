@@ -9,6 +9,7 @@ import type {
   PackFormat,
   PackMod,
   ParsedPack,
+  ProviderVersion,
 } from "./types";
 
 interface MrIndex {
@@ -67,7 +68,7 @@ function overridePathOf(path: string, format: PackFormat, rootPrefix: string): s
   if (format === "curseforge") {
     return path.startsWith("overrides/") ? path : null;
   }
-  if (/^.*mods\/[^/]+\.jar$/i.test(path)) return null;
+  if (isRawJar(path)) return null;
   const rel = path.slice(rootPrefix.length);
   return rel ? `overrides/${rel}` : null;
 }
@@ -86,8 +87,9 @@ function loaderFromMrDependencies(deps: Record<string, string>) {
 }
 
 function loaderFromCfManifest(m: CfManifest) {
-  const primary = m.minecraft.modLoaders.find((l) => l.primary) ?? m.minecraft.modLoaders[0];
-  if (!primary) return {};
+  const loaders = m.minecraft?.modLoaders ?? [];
+  const primary = loaders.find((l) => l.primary) ?? loaders[0];
+  if (!primary?.id) return {};
   const [rawName, ...rest] = primary.id.split("-");
   const name = rawName.toLowerCase();
   const loader = (["fabric", "forge", "neoforge", "quilt"] as const).find((l) => l === name);
@@ -108,8 +110,25 @@ function modrinthIdsFromUrl(url: string | undefined) {
   return m ? { projectId: m[1], versionId: m[2] } : {};
 }
 
+/**
+ * Cle de resolution d'un mod.
+ *
+ * Prefixee par l'identifiant du pack, et non par son etiquette : l'etiquette
+ * vaut "?" au moment du parsing, et le compteur repart de zero a chaque
+ * chargement de page. Un pack ajoute apres un rechargement reprenait donc les
+ * cles d'un pack deja present — ecarter un mod en ecartait deux.
+ */
 let counter = 0;
-const nextKey = (prefix: string) => `${prefix}-${(counter++).toString(36)}`;
+const nextKey = (packId: string) => `${packId.slice(0, 8)}-${(counter++).toString(36)}`;
+
+/**
+ * Dans une archive brute, tous les jars sont lus comme des mods, ou qu'ils
+ * soient ranges : les recopier aussi comme fichiers d'instance les livrerait
+ * deux fois, dont une a la racine de l'instance.
+ */
+export function isRawJar(path: string): boolean {
+  return /\.jar$/i.test(path);
+}
 
 /** Dossiers qu'on trouve a la racine d'une instance Minecraft. */
 const INSTANCE_DIRS = [
@@ -130,8 +149,11 @@ function commonPrefix(paths: string[]): string {
   const candidates = new Set<string>();
   for (const p of paths) {
     for (const dir of INSTANCE_DIRS) {
-      const i = p.indexOf(dir);
-      if (i > 0 && (i === 0 || p[i - 1] === "/")) candidates.add(p.slice(0, i));
+      // Toutes les occurrences : la premiere peut tomber au milieu d'un nom
+      // ("extramods/") et masquer le vrai dossier plus loin.
+      for (let i = p.indexOf(dir); i > 0; i = p.indexOf(dir, i + 1)) {
+        if (p[i - 1] === "/") candidates.add(p.slice(0, i));
+      }
     }
   }
   // Le prefixe le plus court qui couvre toute l'archive : un prefixe plus
@@ -198,7 +220,7 @@ async function identifyJars(
       fingerprints.push(fp);
       staged.push({
         mod: {
-          key: nextKey(pack.label),
+          key: nextKey(pack.id),
           name: meta?.name ?? nameFromFileName(fileName),
           kind: "mod",
           provider: "unknown",
@@ -228,11 +250,17 @@ async function identifyJars(
   traiter();
 
   const [mrHits, cfHits] = await Promise.all([
-    modrinth.lookupByHashes(sha1s).catch(() => new Map()),
-    curseforge.lookupByFingerprints(fingerprints).catch(() => new Map()),
+    modrinth.lookupByHashes(sha1s).catch(() => new Map<string, ProviderVersion>()),
+    curseforge.lookupByFingerprints(fingerprints).catch(() => new Map<number, ProviderVersion>()),
   ]);
 
   let identifies = 0;
+  // Le loader et la version se deduisent a la majorite : le premier mod
+  // identifie ne suffit pas. Un mod publie pour Fabric et Quilt, ou pour
+  // 1.20 a 1.20.4, aurait decide seul pour tout le pack.
+  const votesLoader = new Map<string, number>();
+  const votesVersion = new Map<string, number>();
+  const voter = (m: Map<string, number>, k: string) => m.set(k, (m.get(k) ?? 0) + 1);
   for (const { mod, fp } of staged) {
     const hit = (mod.hashes.sha1 ? mrHits.get(mod.hashes.sha1) : undefined) ?? cfHits.get(fp);
     if (hit) {
@@ -241,16 +269,47 @@ async function identifyJars(
       mod.projectId = hit.projectId;
       mod.fileId = hit.versionId;
       mod.versionNumber = hit.versionNumber;
-      if (opts.deduireCible) {
-        if (!pack.loader && hit.loaders.length) pack.loader = hit.loaders[0] as LoaderId;
-        if (!pack.minecraft && hit.gameVersions.length) pack.minecraft = hit.gameVersions[0];
-      }
+      for (const l of new Set(hit.loaders)) if (isLoader(l)) voter(votesLoader, l);
+      for (const v of new Set(hit.gameVersions)) voter(votesVersion, v);
     }
     pack.mods.push(mod);
   }
 
+  if (opts.deduireCible) {
+    // A egalite, un mod Fabric publie aussi pour Quilt designe Fabric : c'est
+    // l'ordre de LOADER_IDS. Pour les versions, la plus recente l'emporte.
+    pack.loader ??= majorite(
+      votesLoader,
+      (a, b) => LOADER_IDS.indexOf(b) - LOADER_IDS.indexOf(a),
+    ) as LoaderId | undefined;
+    pack.minecraft ??= majorite(votesVersion, compareVersions);
+  }
+
   await enrichModrinth(pack.mods);
   return { total: staged.length, identifies };
+}
+
+const LOADER_IDS: readonly string[] = ["fabric", "quilt", "forge", "neoforge"];
+const isLoader = (l: string): l is LoaderId => LOADER_IDS.includes(l);
+
+/** Clef la plus citee ; `prefere(a, b) > 0` departage une egalite en faveur de a. */
+function majorite(
+  votes: Map<string, number>,
+  prefere: (a: string, b: string) => number,
+): string | undefined {
+  let best: string | undefined;
+  let bestCount = 0;
+  for (const [k, n] of votes) {
+    if (n > bestCount || (n === bestCount && best !== undefined && prefere(k, best) > 0)) {
+      best = k;
+      bestCount = n;
+    }
+  }
+  return best;
+}
+
+function compareVersions(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true });
 }
 
 export async function parsePack(
@@ -327,6 +386,10 @@ export async function parsePack(
   // sautent les jars pour economiser la memoire et ne pourraient plus la
   // deduire.
   const brut = format === "raw" || !manifesteLu;
+  // Un manifeste illisible fait lire le pack en mode brut : le format doit le
+  // dire, sinon la relecture des fichiers d'instance repartirait sur le
+  // format declare et ne retrouverait pas les memes chemins.
+  if (brut) pack.format = "raw";
   pack.rootPrefix = brut ? commonPrefix(noms) : "";
   pack.overridePaths = noms
     .map((n) => overridePathOf(n, brut ? "raw" : format, pack.rootPrefix ?? ""))
@@ -357,13 +420,14 @@ async function parseMrpack(
   pack.summary = index.summary;
   Object.assign(pack, loaderFromMrDependencies(index.dependencies ?? {}));
 
-  for (const f of index.files) {
+  for (const f of index.files ?? []) {
+    if (typeof f?.path !== "string") continue;
     const entry = classifyEntry(f.path);
     const { projectId, versionId } = modrinthIdsFromUrl(f.downloads?.[0]);
     const fileName = f.path.split("/").pop() ?? f.path;
 
     const mod: PackMod = {
-      key: nextKey(pack.label),
+      key: nextKey(pack.id),
       name: nameFromFileName(fileName),
       kind: entry === "override" ? "mod" : entry,
       provider: projectId ? "modrinth" : "unknown",
@@ -396,7 +460,7 @@ async function parseCurseforge(
   warnings: string[],
 ): Promise<boolean> {
   const manifest = readJson<CfManifest>(entries, "manifest.json");
-  if (!manifest) {
+  if (!manifest || !Array.isArray(manifest.files)) {
     warnings.push("manifest.json illisible, lecture en mode brut.");
     return false;
   }
@@ -425,7 +489,7 @@ async function parseCurseforge(
     const cfName = v?.fileName ?? `${f.projectID}-${f.fileID}.jar`;
     const cfKind: ContentKind = cfName.toLowerCase().endsWith(".jar") ? "mod" : "resourcepack";
     pack.mods.push({
-      key: nextKey(pack.label),
+      key: nextKey(pack.id),
       name: v ? nameFromFileName(v.fileName) : `Projet CurseForge ${f.projectID}`,
       kind: cfKind,
       provider: "curseforge",
@@ -481,7 +545,7 @@ export function extractOverrides(
 
   const prefix = pack.rootPrefix ?? commonPrefix(Object.keys(entries));
   for (const [path, data] of Object.entries(entries)) {
-    if (/^.*mods\/[^/]+\.jar$/i.test(path)) continue;
+    if (isRawJar(path)) continue;
     const rel = path.slice(prefix.length);
     if (!rel) continue;
     out[`overrides/${rel}`] = data;
@@ -518,7 +582,13 @@ async function enrichCurseforge(mods: PackMod[]) {
       if (p) {
         m.name = p.title;
         m.slug = p.slug;
-        m.kind = p.kind;
+        // Le type devine d'apres l'extension (.zip = resource pack) est
+        // corrige par le projet : le dossier doit suivre, sinon un shader
+        // reste range dans resourcepacks/.
+        if (m.kind !== p.kind) {
+          m.kind = p.kind;
+          m.path = `${CONTENT_INFO[p.kind].folder}/${m.fileName}`;
+        }
       }
     }
   } catch {

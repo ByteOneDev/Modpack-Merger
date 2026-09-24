@@ -1,7 +1,7 @@
 "use client";
 
 import { readZip } from "@/lib/core/zip";
-import { extractOverrides } from "@/lib/core/parse";
+import { extractOverrides, isRawJar } from "@/lib/core/parse";
 import { dedupe, enrichEnvironments, resolveAll } from "@/lib/core/merge/resolve";
 import { resolveDependencies } from "@/lib/core/merge/deps";
 import { detectFunctionalConflicts } from "@/lib/core/merge/functional";
@@ -33,7 +33,15 @@ export async function readPackFiles(packs: ParsedPack[]): Promise<PackFiles[]> {
       label: pack.label,
       // Les jars sont exclus avant decompression : ils representent l'essentiel
       // du poids d'un pack et ne servent pas a comparer des configurations.
-      files: extractOverrides(readZip(buf, (path) => !/(^|\/)mods\/[^/]+\.jar$/i.test(path)), pack),
+      files: extractOverrides(
+        readZip(buf, (path) =>
+          // Une archive brute lit tous ses jars comme des mods, ou qu'ils soient.
+          pack.format === "raw"
+            ? !isRawJar(path)
+            : !/(^|\/)mods\/[^/]+\.jar$/i.test(path),
+        ),
+        pack,
+      ),
     });
   }
   return out;
