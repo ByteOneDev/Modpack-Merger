@@ -189,6 +189,7 @@ export default function ExportPage() {
       <ExportGate
         readiness={readiness}
         onGoToMods={() => router.push("/mods/")}
+        onGoToConflicts={() => router.push("/conflits/")}
         onExclude={(keys) =>
           setState((prev) => ({ ...prev, ...excludeMany(prev, keys, settings) }))
         }
@@ -303,7 +304,7 @@ export default function ExportPage() {
               Bloque : {summarizeBlockers(readiness)}.
             </span>
           )}
-          <Button variant="outline" onClick={() => router.push("/fichiers/")}>
+          <Button variant="outline" onClick={() => router.push("/conflits/")}>
             Retour
           </Button>
         </div>

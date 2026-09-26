@@ -176,6 +176,13 @@ export interface ModResolution {
    * « Remettre » ne retrouvait ni la version retenue ni la substitution.
    */
   beforeExclusion?: { status: ResolutionStatus; picked?: ProviderVersion; reason: string };
+  /** cle de l'element conserve a sa place, quand celui-ci est un doublon */
+  duplicateOf?: string;
+  /**
+   * Choisi explicitement par l'utilisateur parmi des doublons : il l'emporte
+   * sur la regle « version la plus recente ».
+   */
+  keptByUser?: boolean;
 }
 
 export interface Alternative {
@@ -200,11 +207,23 @@ export type OverrideDecision = string; // id de pack gagnant, "merge", "all" ou 
 export interface OverrideConflict {
   /** chemin de destination, ex. overrides/config/x.toml */
   path: string;
-  /** contributions, une par pack qui fournit ce fichier */
-  sides: { packId: string; label: string; size: number }[];
+  /**
+   * contributions, une par pack qui fournit ce fichier, la version retenue
+   * par defaut en premier
+   */
+  sides: { packId: string; label: string; size: number; modified?: number }[];
   kind: "text" | "json" | "keyvalue" | "binary";
   mergeable: boolean;
   suggestion: OverrideDecision;
+  /** pack dont la version est la plus recente, quand les dates le disent */
+  newestPackId?: string;
+  /**
+   * true quand la suggestion est sure (fusion, ou version la plus recente
+   * connue) : elle s'applique d'office. Sinon l'utilisateur doit confirmer.
+   */
+  auto: boolean;
+  /** pourquoi cette suggestion, en une phrase */
+  rationale: string;
   note?: string;
 }
 

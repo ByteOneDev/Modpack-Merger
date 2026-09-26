@@ -201,7 +201,7 @@ export const STEPS = [
   { href: "/", label: "Modpacks", short: "Packs" },
   { href: "/cible/", label: "Configuration cible", short: "Cible" },
   { href: "/mods/", label: "Mods", short: "Mods" },
-  { href: "/fichiers/", label: "Fichiers de config", short: "Fichiers" },
+  { href: "/conflits/", label: "Conflits", short: "Conflits" },
   { href: "/export/", label: "Export", short: "Export" },
 ] as const;
 

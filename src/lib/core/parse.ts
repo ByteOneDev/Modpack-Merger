@@ -57,7 +57,7 @@ export function detectFormatFromNames(names: Iterable<string>): PackFormat {
  * qui embarque un monde sauvegarde, ouvrir chaque fichier pour lire son nom
  * represente plusieurs centaines de Mo pour rien.
  */
-function overridePathOf(path: string, format: PackFormat, rootPrefix: string): string | null {
+export function overridePathOf(path: string, format: PackFormat, rootPrefix: string): string | null {
   if (format === "mrpack") {
     return path.startsWith("overrides/") ||
       path.startsWith("client-overrides/") ||

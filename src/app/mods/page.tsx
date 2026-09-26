@@ -4,7 +4,7 @@ import * as React from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowRight, CircleAlert, CircleCheck, Layers,
-  RotateCcw, Search, Trash2, TriangleAlert, Wrench,
+  RotateCcw, Search, Trash2, Wrench,
 } from "lucide-react";
 import { PageHeader } from "@/components/page-header";
 import { StepGuard } from "@/components/empty-state";
@@ -12,7 +12,6 @@ import { RamCard } from "@/components/ram-card";
 import { AlternativesList } from "@/components/alternatives";
 import { BulkAlternatives } from "@/components/bulk-alternatives";
 import { AddContent } from "@/components/add-content";
-import { PinnedConflicts } from "@/components/pinned-conflicts";
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,9 +20,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useMerge } from "@/lib/store";
+import { pendingFileConflicts } from "@/lib/readiness";
 import {
-  addMod, addSchematics, alignPinnedVersion, applyAlternative, applyAlternatives, excludeMod,
-  resolveConflict, restoreMod,
+  addMod, addSchematics, applyAlternative, applyAlternatives, excludeMod, restoreMod,
 } from "@/lib/actions";
 import { detectSchematicFolder } from "@/lib/core/build";
 import { CONTENT_INFO, SCHEMATIC_MODS, countLabel, type ContentKind } from "@/lib/core/content";
@@ -67,7 +66,7 @@ export default function ModsPage() {
         title="Resultat de la fusion"
         description={`${kept.length + substituted.length} elements retenus pour ${target.loader} ${target.minecraft}, a partir de ${state.packs.length} packs.`}
         action={
-          <Button onClick={() => router.push("/fichiers/")}>
+          <Button onClick={() => router.push("/conflits/")}>
             Continuer <ArrowRight />
           </Button>
         }
@@ -106,17 +105,13 @@ export default function ModsPage() {
         </div>
       )}
 
-      <PinnedConflicts
-        conflicts={state.pinnedConflicts}
-        resolutions={state.resolutions}
-        onAlign={async (c) => {
-          const patch = await alignPinnedVersion(state, c, settings);
-          if (!patch.error) setState((prev) => ({ ...prev, ...patch }));
-          return patch;
-        }}
-        onDropDependent={(key) =>
-          setState((prev) => ({ ...prev, ...excludeMod(prev, key, settings) }))
+      <ConflictsBanner
+        blocking={state.pinnedConflicts.length + hardConflicts.length}
+        toDecide={
+          state.conflicts.length - hardConflicts.length + pendingFileConflicts(state).length
         }
+        duplicates={state.resolutions.filter((r) => r.status === "duplicate").length}
+        onOpen={() => router.push("/conflits/")}
       />
 
       {missing.length > 0 && (
@@ -187,60 +182,6 @@ export default function ModsPage() {
                 ))}
               </div>
             </details>
-          </CardContent>
-        </Card>
-      )}
-
-      {state.conflicts.length > 0 && (
-        <Card className="mb-6">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Layers className="text-warning size-4" />
-              Doublons fonctionnels
-            </CardTitle>
-            <CardDescription>
-              Des mods differents qui font la meme chose. Les conflits marques
-              <Badge variant="destructive" className="mx-1.5">
-                bloquant
-              </Badge>
-              empechent le jeu de demarrer.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {state.conflicts.map((c) => (
-              <div key={c.groupId} className="rounded-lg border p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium">{c.groupLabel}</span>
-                  <Badge variant={c.severity === "hard" ? "destructive" : "warning"}>
-                    {c.severity === "hard" ? "bloquant" : "redondant"}
-                  </Badge>
-                </div>
-                <p className="text-muted-foreground mt-1 text-sm text-pretty">{c.explanation}</p>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {c.members.map((m) => (
-                    <Button
-                      key={m.key}
-                      size="sm"
-                      variant={m.recommended ? "default" : "outline"}
-                      onClick={() =>
-                        setState((prev) => ({
-                          ...prev,
-                          ...resolveConflict(
-                            prev,
-                            m.key,
-                            c.members.map((x) => x.key),
-                            settings,
-                          ),
-                        }))
-                      }
-                    >
-                      Garder {m.name}
-                      {m.recommended && " ★"}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-            ))}
           </CardContent>
         </Card>
       )}
@@ -349,24 +290,9 @@ export default function ModsPage() {
         </CardContent>
       </Card>
 
-      {hardConflicts.length > 0 && (
-        <Alert variant="warning" className="mb-6">
-          <TriangleAlert />
-          <AlertTitle>
-            {hardConflicts.length} conflit{hardConflicts.length > 1 ? "s" : ""} bloquant
-            {hardConflicts.length > 1 ? "s" : ""} non resolu
-            {hardConflicts.length > 1 ? "s" : ""}
-          </AlertTitle>
-          <AlertDescription>
-            Le pack se generera quand meme, mais il plantera au demarrage tant que deux mods du
-            meme groupe cohabitent.
-          </AlertDescription>
-        </Alert>
-      )}
-
       <div className="flex items-center gap-3">
-        <Button onClick={() => router.push("/fichiers/")}>
-          Continuer vers les fichiers <ArrowRight />
+        <Button onClick={() => router.push("/conflits/")}>
+          Continuer vers les conflits <ArrowRight />
         </Button>
         <Button variant="outline" onClick={() => router.push("/cible/")}>
           <Wrench /> Changer la cible
@@ -461,5 +387,43 @@ function ModList({
         </div>
       ))}
     </div>
+  );
+}
+
+/** Renvoi vers le centre de conflits, avec ce qui y attend. */
+function ConflictsBanner({
+  blocking,
+  toDecide,
+  duplicates,
+  onOpen,
+}: {
+  blocking: number;
+  toDecide: number;
+  duplicates: number;
+  onOpen: () => void;
+}) {
+  if (!blocking && !toDecide && !duplicates) return null;
+  const urgent = blocking > 0 || toDecide > 0;
+  return (
+    <Alert variant={blocking ? "destructive" : urgent ? "warning" : "info"} className="mb-6">
+      {blocking ? <CircleAlert /> : <Layers />}
+      <AlertTitle>
+        {blocking
+          ? `${blocking} conflit${blocking > 1 ? "s" : ""} bloquant${blocking > 1 ? "s" : ""}`
+          : urgent
+            ? `${toDecide} conflit${toDecide > 1 ? "s" : ""} à décider`
+            : `${duplicates} doublon${duplicates > 1 ? "s" : ""} réglé${duplicates > 1 ? "s" : ""} automatiquement`}
+      </AlertTitle>
+      <AlertDescription>
+        <p>
+          {urgent
+            ? "Versions incompatibles, mods qui font la même chose, fichiers de configuration en double : tout se règle au même endroit."
+            : "Un même mod arrivait par deux chemins : seule la version la plus récente est gardée."}
+        </p>
+        <Button size="sm" variant="outline" className="mt-2" onClick={onOpen}>
+          Ouvrir le centre de conflits <ArrowRight />
+        </Button>
+      </AlertDescription>
+    </Alert>
   );
 }

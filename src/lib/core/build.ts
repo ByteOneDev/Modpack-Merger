@@ -1,7 +1,7 @@
 import { ZipStream, isPrecompressed, toU8, type ZipSink } from "./zip";
 import { bytesEqual } from "./hash";
 import { latestLoaderVersion, MRPACK_LOADER_KEY } from "./loaderversions";
-import { applyDecision, type OverrideSide, type PackFiles } from "./merge/overrides";
+import { applyDecision, orderSides, type OverrideSide, type PackFiles } from "./merge/overrides";
 import { estimateRam } from "./merge/ram";
 import { getProviderConfig } from "./providers/config";
 import { CONTENT_INFO, SCHEMATIC_MODS, type ContentKind } from "./content";
@@ -268,7 +268,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
   for (const pack of opts.packFiles) {
     for (const [path, data] of Object.entries(pack.files)) {
       const list = byPath.get(path) ?? [];
-      list.push({ packId: pack.packId, label: pack.label, data });
+      list.push({ packId: pack.packId, label: pack.label, data, modified: pack.dates?.[path] });
       byPath.set(path, list);
     }
   }
@@ -281,7 +281,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
       if (write(outPath(path), sides[0].data)) overridesWritten++;
       continue;
     }
-    const decision = opts.decisions[path] ?? sides[0].packId;
+    const decision = opts.decisions[path] ?? orderSides(sides).ordered[0].packId;
     for (const file of applyDecision(path, sides, decision)) {
       if (write(outPath(file.path), file.data)) overridesWritten++;
     }

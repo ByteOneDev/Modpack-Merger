@@ -1,13 +1,16 @@
 "use client";
 
-import { readZip } from "@/lib/core/zip";
-import { extractOverrides, isRawJar } from "@/lib/core/parse";
+import { listZipEntries, readZip } from "@/lib/core/zip";
+import { extractOverrides, isRawJar, overridePathOf } from "@/lib/core/parse";
 import { dedupe, enrichEnvironments, resolveAll } from "@/lib/core/merge/resolve";
 import { resolveDependencies } from "@/lib/core/merge/deps";
 import { detectFunctionalConflicts } from "@/lib/core/merge/functional";
 import { detectPinnedConflicts } from "@/lib/core/merge/pinned";
-import { computeOverrideConflicts, type PackFiles } from "@/lib/core/merge/overrides";
+import {
+  computeOverrideConflicts, reliableDates, type PackFiles,
+} from "@/lib/core/merge/overrides";
 import { estimateRam } from "@/lib/core/merge/ram";
+import { collapseDuplicates } from "@/lib/core/merge/duplicates";
 import { loadArchive } from "@/lib/archives";
 import type { Settings } from "@/lib/settings";
 import type { MergeState } from "@/lib/store";
@@ -28,9 +31,19 @@ export async function readPackFiles(packs: ParsedPack[]): Promise<PackFiles[]> {
   for (const pack of packs) {
     const buf = await loadArchive(pack.id);
     if (!buf) continue;
+
+    // Dates lues dans le catalogue, sans rien decompresser : elles servent a
+    // designer la version la plus recente d'un fichier en conflit.
+    const dates: Record<string, number> = {};
+    for (const e of listZipEntries(buf)) {
+      const dest = overridePathOf(e.path, pack.format, pack.rootPrefix ?? "");
+      if (dest && e.modified !== undefined) dates[dest] = e.modified;
+    }
+
     out.push({
       packId: pack.id,
       label: pack.label,
+      dates: reliableDates(dates),
       // Les jars sont exclus avant decompression : ils representent l'essentiel
       // du poids d'un pack et ne servent pas a comparer des configurations.
       files: extractOverrides(
@@ -82,6 +95,10 @@ export async function runAnalysis(
     onProgress({ phase: "Resolution des dependances", done: 1, total: 1 });
   }
 
+  // 3 bis. un meme mod arrive par deux chemins (pack CurseForge et
+  // dependance Modrinth, par exemple) : seule la version la plus recente reste.
+  withDeps = collapseDuplicates(withDeps);
+
   // 4. doublons fonctionnels
   const conflicts = settings.detectFunctionalConflicts
     ? detectFunctionalConflicts(withDeps)
@@ -98,8 +115,10 @@ export async function runAnalysis(
   const { conflicts: overrideConflicts, uniqueCount, identicalCount } =
     computeOverrideConflicts(packFiles);
 
+  // Seules les suggestions sures sont appliquees d'office ; les autres
+  // attendent une confirmation, et bloquent l'export tant qu'elle manque.
   const decisions: Record<string, string> = {};
-  for (const c of overrideConflicts) decisions[c.path] = c.suggestion;
+  for (const c of overrideConflicts) if (c.auto) decisions[c.path] = c.suggestion;
 
   // 6. estimation memoire
   const hasShaders = packs.some((p) =>

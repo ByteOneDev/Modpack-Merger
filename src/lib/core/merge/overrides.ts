@@ -17,6 +17,51 @@ export interface PackFiles {
   packId: string;
   label: string;
   files: Record<string, Uint8Array>;
+  /**
+   * Date de modification de chaque fichier, par chemin de destination. Seules
+   * les dates jugees fiables y figurent (voir reliableDates).
+   */
+  dates?: Record<string, number>;
+}
+
+/**
+ * Ecarte les dates qui ne disent rien.
+ *
+ * Certains outils d'export datent tous les fichiers de l'instant de l'export :
+ * la date d'un fichier n'y dit rien de sa derniere modification. Quand
+ * presque tout un pack porte la meme date, on n'en garde aucune.
+ */
+export function reliableDates(dates: Record<string, number>): Record<string, number> {
+  const values = Object.values(dates);
+  if (values.length < 5) return dates;
+  const counts = new Map<number, number>();
+  // A la minute pres : un export qui dure quelques secondes reste un seul instant.
+  for (const v of values) {
+    const minute = Math.floor(v / 60_000);
+    counts.set(minute, (counts.get(minute) ?? 0) + 1);
+  }
+  const top = Math.max(...counts.values());
+  return top / values.length >= 0.9 ? {} : dates;
+}
+
+interface DatedSide {
+  packId: string;
+  modified?: number;
+}
+
+/**
+ * Ordre dans lequel les versions d'un fichier font autorite : la plus
+ * recente d'abord quand toutes sont datees et qu'une seule est la plus
+ * recente, sinon l'ordre des packs.
+ */
+export function orderSides<T extends DatedSide>(sides: T[]): { ordered: T[]; newest?: T } {
+  const dated = sides.every((s) => s.modified !== undefined);
+  if (!dated) return { ordered: sides };
+  const max = Math.max(...sides.map((s) => s.modified!));
+  const newest = sides.filter((s) => s.modified === max);
+  if (newest.length !== 1) return { ordered: sides };
+  // Tri stable : a date egale, l'ordre des packs departage.
+  return { ordered: [...sides].sort((a, b) => b.modified! - a.modified!), newest: newest[0] };
 }
 
 const JSON_EXT = /\.(json|json5|jsonc)$/i;
@@ -45,11 +90,14 @@ export function computeOverrideConflicts(packs: PackFiles[]): {
   identicalCount: number;
 } {
   // Regroupe toutes les contributions par chemin de destination
-  const byPath = new Map<string, { packId: string; label: string; data: Uint8Array }[]>();
+  const byPath = new Map<
+    string,
+    { packId: string; label: string; data: Uint8Array; modified?: number }[]
+  >();
   for (const p of packs) {
     for (const [path, data] of Object.entries(p.files)) {
       const list = byPath.get(path) ?? [];
-      list.push({ packId: p.packId, label: p.label, data });
+      list.push({ packId: p.packId, label: p.label, data, modified: p.dates?.[path] });
       byPath.set(path, list);
     }
   }
@@ -72,15 +120,35 @@ export function computeOverrideConflicts(packs: PackFiles[]): {
     const kind = classify(path, sides[0].data);
     const blocked = NEVER_MERGE.some((re) => re.test(path));
     const mergeable = !blocked && (kind === "json" || kind === "keyvalue");
+    const { ordered, newest } = orderSides(sides);
+    const first = ordered[0];
+
+    // Une fusion garde toutes les cles : c'est un choix sur, qui s'applique
+    // d'office. Sinon, la version la plus recente l'emporte quand les dates
+    // la designent ; a defaut, rien ne permet de trancher et on demande.
+    const auto = mergeable || !!newest;
+    const rationale = mergeable
+      ? newest
+        ? `Fusion des cles ; en cas de valeur differente, la version la plus recente (pack ${first.label}) l'emporte.`
+        : `Fusion des cles ; en cas de valeur differente, le pack ${first.label}, le plus haut dans ta liste, l'emporte.`
+      : newest
+        ? `Version la plus recente : celle du pack ${first.label}.`
+        : `Impossible de dire quelle version est la plus recente : le pack ${first.label}, le plus haut dans ta liste, est propose par defaut.`;
 
     conflicts.push({
       path,
-      sides: sides.map((s) => ({ packId: s.packId, label: s.label, size: s.data.length })),
+      sides: ordered.map((s) => ({
+        packId: s.packId,
+        label: s.label,
+        size: s.data.length,
+        modified: s.modified,
+      })),
       kind,
       mergeable,
-      // Par defaut on fusionne si on sait le faire, sinon le pack prioritaire
-      // (le premier de la liste) l'emporte.
-      suggestion: mergeable ? "merge" : sides[0].packId,
+      suggestion: mergeable ? "merge" : first.packId,
+      newestPackId: newest?.packId,
+      auto,
+      rationale,
       note: blocked
         ? "Fichier propre a une instance : fusion deconseillee."
         : kind === "binary"
@@ -263,6 +331,7 @@ export interface OverrideSide {
   packId: string;
   label: string;
   data: Uint8Array;
+  modified?: number;
 }
 
 /**
@@ -275,6 +344,9 @@ export function applyDecision(
   decision: OverrideDecision,
 ): { path: string; data: Uint8Array }[] {
   if (decision === "skip") return [];
+  // La version qui fait autorite passe en premier : c'est elle qui garde le
+  // chemin d'origine et qui tranche les valeurs divergentes d'une fusion.
+  sides = orderSides(sides).ordered;
 
   if (decision === "all") {
     // Le pack prioritaire garde le chemin, les autres sont suffixes pour que

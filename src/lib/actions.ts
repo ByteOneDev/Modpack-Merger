@@ -8,6 +8,7 @@ import {
   detectPinnedConflicts, fetchPinnedVersion, type PinnedConflict,
 } from "@/lib/core/merge/pinned";
 import { estimateRam } from "@/lib/core/merge/ram";
+import { collapseDuplicates } from "@/lib/core/merge/duplicates";
 import {
   LOADER_COMPAT,
   type Alternative,
@@ -41,9 +42,12 @@ function defaultEnv(kind: ContentKind, side: "client" | "server") {
 /** Recalcule ce qui depend de la liste de mods : conflits et memoire. */
 function withDerived(
   state: MergeState,
-  resolutions: ModResolution[],
+  proposed: ModResolution[],
   settings: Settings,
 ): Partial<MergeState> {
+  // Toute modification peut faire entrer un doublon : une dependance, une
+  // substitution, un mod remis dans la liste.
+  const resolutions = collapseDuplicates(proposed);
   return {
     resolutions,
     conflicts: settings.detectFunctionalConflicts
@@ -463,6 +467,39 @@ export async function alignPinnedVersion(
       : r,
   );
 
+  return withDerived(state, resolutions, settings);
+}
+
+/**
+ * Garde cet exemplaire d'un mod present en double, a la place de celui que la
+ * regle « version la plus recente » avait retenu.
+ */
+export function preferDuplicate(
+  state: MergeState,
+  key: string,
+  settings: Settings,
+): Partial<MergeState> {
+  const chosen = state.resolutions.find((r) => r.key === key);
+  const before = chosen?.beforeExclusion;
+  if (!chosen || chosen.status !== "duplicate" || !before?.picked) return {};
+
+  const resolutions = state.resolutions.map((r): ModResolution => {
+    if (r.key === key) {
+      return {
+        ...r,
+        status: before.status,
+        picked: before.picked,
+        reason: before.reason,
+        beforeExclusion: undefined,
+        duplicateOf: undefined,
+        keptByUser: true,
+      };
+    }
+    // Un seul choix explicite par groupe : l'ancien gagnant redevient
+    // candidat ordinaire, et collapseDuplicates l'ecartera.
+    if (r.key === chosen.duplicateOf) return { ...r, keptByUser: undefined };
+    return r;
+  });
   return withDerived(state, resolutions, settings);
 }
 

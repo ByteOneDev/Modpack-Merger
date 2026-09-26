@@ -65,6 +65,24 @@ interface CatalogEntry {
   name: Uint8Array;
   compressed: number;
   uncompressed: number;
+  /** date de modification, au format MS-DOS */
+  dosDate: number;
+  dosTime: number;
+}
+
+/**
+ * Date de modification d'une entree, ou undefined si elle n'a pas de sens.
+ *
+ * Beaucoup d'outils ecrivent 0, ou le 1er janvier 1980 (la plus petite date
+ * que le format sache representer) : ce n'est pas une date, c'est une absence.
+ */
+export function dosToMillis(date: number, time: number): number | undefined {
+  const year = (date >> 9) + 1980;
+  const month = (date >> 5) & 0x0f;
+  const day = date & 0x1f;
+  if (year <= 1980 || month < 1 || month > 12 || day < 1) return undefined;
+  const d = new Date(year, month - 1, day, time >> 11, (time >> 5) & 0x3f, (time & 0x1f) * 2);
+  return Number.isNaN(d.getTime()) ? undefined : d.getTime();
 }
 
 /** Position du catalogue central et nombre d'entrees annonce. */
@@ -143,7 +161,13 @@ function* walkCatalog(
       }
     }
 
-    yield { name: buf.subarray(p + 46, p + 46 + nameLen), compressed, uncompressed };
+    yield {
+      name: buf.subarray(p + 46, p + 46 + nameLen),
+      compressed,
+      uncompressed,
+      dosTime: dv.getUint16(p + 12, true),
+      dosDate: dv.getUint16(p + 14, true),
+    };
     p += 46 + nameLen + extraLen + commentLen;
   }
 }
@@ -200,6 +224,8 @@ export interface ZipEntryInfo {
   path: string;
   /** taille une fois decompressee */
   size: number;
+  /** date de modification (ms), absente quand l'archive n'en porte pas */
+  modified?: number;
 }
 
 /**
@@ -218,7 +244,9 @@ export function listZipEntries(buf: Uint8Array): ZipEntryInfo[] {
   const out: ZipEntryInfo[] = [];
   for (const e of walkCatalog(buf, dv, catalog)) {
     const path = normalizePath(dec.decode(e.name));
-    if (!path.endsWith("/") && isSafePath(path)) out.push({ path, size: e.uncompressed });
+    if (!path.endsWith("/") && isSafePath(path)) {
+      out.push({ path, size: e.uncompressed, modified: dosToMillis(e.dosDate, e.dosTime) });
+    }
   }
   return out;
 }
