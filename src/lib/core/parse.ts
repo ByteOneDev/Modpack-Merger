@@ -69,6 +69,7 @@ export function overridePathOf(path: string, format: PackFormat, rootPrefix: str
     return path.startsWith("overrides/") ? path : null;
   }
   if (isRawJar(path)) return null;
+  if (!path.startsWith(rootPrefix)) return null;
   const rel = path.slice(rootPrefix.length);
   return rel ? `overrides/${rel}` : null;
 }
@@ -390,7 +391,11 @@ export async function parsePack(
   // dire, sinon la relecture des fichiers d'instance repartirait sur le
   // format declare et ne retrouverait pas les memes chemins.
   if (brut) pack.format = "raw";
-  pack.rootPrefix = brut ? commonPrefix(noms) : "";
+  // Un .mrpack ou un zip CurseForge au manifeste illisible garde ses
+  // fichiers d'instance sous overrides/ : c'est ce dossier qu'il faut
+  // retirer, sans quoi ils ressortiraient en overrides/overrides/, et le
+  // manifeste casse serait recopie avec eux.
+  pack.rootPrefix = !brut ? "" : format === "raw" ? commonPrefix(noms) : "overrides/";
   pack.overridePaths = noms
     .map((n) => overridePathOf(n, brut ? "raw" : format, pack.rootPrefix ?? ""))
     .filter((n): n is string => n !== null);
@@ -546,6 +551,7 @@ export function extractOverrides(
   const prefix = pack.rootPrefix ?? commonPrefix(Object.keys(entries));
   for (const [path, data] of Object.entries(entries)) {
     if (isRawJar(path)) continue;
+    if (!path.startsWith(prefix)) continue;
     const rel = path.slice(prefix.length);
     if (!rel) continue;
     out[`overrides/${rel}`] = data;
