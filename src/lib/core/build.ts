@@ -1,11 +1,12 @@
 import { ZipStream, isPrecompressed, toU8, type ZipSink } from "./zip";
 import { bytesEqual } from "./hash";
 import { latestLoaderVersion, MRPACK_LOADER_KEY } from "./loaderversions";
-import { applyDecision, type OverrideSide, type PackFiles } from "./merge/overrides";
+import { applyDecision, orderSides, type OverrideSide, type PackFiles } from "./merge/overrides";
 import { estimateRam } from "./merge/ram";
 import { getProviderConfig } from "./providers/config";
 import { CONTENT_INFO, SCHEMATIC_MODS, type ContentKind } from "./content";
 import { buildSummary, type PackSummary, type SummaryItem } from "./summary";
+import { envFor, fileSide, includedIn, type Side } from "./sides";
 import type {
   MergeTarget,
   ModResolution,
@@ -13,7 +14,11 @@ import type {
   RamEstimate,
 } from "./types";
 
-export type ExportFormat = "mrpack" | "curseforge";
+/**
+ * mrpack et curseforge produisent un pack pour un lanceur ; server produit
+ * un zip a decompresser tel quel a cote du jar d'un serveur dedie.
+ */
+export type ExportFormat = "mrpack" | "curseforge" | "server";
 
 /**
  * Dossier de destination d'un contenu.
@@ -66,6 +71,16 @@ export interface BuildOptions {
    * Mieux vaut ne rien livrer et dire ce qui manque.
    */
   requireComplete?: boolean;
+  /**
+   * Cote choisi pour chaque element, par cle de resolution. Sert au champ env
+   * d'un .mrpack ; le tri des elements eux-memes est fait par l'appelant.
+   */
+  sides?: Record<string, Side>;
+  /**
+   * Contenu modifie a la main dans l'editeur, par chemin de destination. Il
+   * remplace le fichier d'origine, ou le resultat de la fusion.
+   */
+  configEdits?: Record<string, string>;
   onProgress?: (step: string, done: number, total: number) => void;
 }
 
@@ -233,7 +248,12 @@ export async function buildPack(opts: BuildOptions): Promise<{
   blob: Blob | null;
   report: BuildReport;
 }> {
-  const { target, format, bundleJars } = opts;
+  const { target, format } = opts;
+  const server = format === "server";
+  // Un serveur n'a pas de lanceur pour telecharger quoi que ce soit : tout
+  // doit etre dans l'archive.
+  const bundleJars = server || opts.bundleJars;
+  const dist = server ? "server" : "client";
   const warnings: string[] = [];
   const failed: BuildReport["modsFailed"] = [];
 
@@ -261,14 +281,23 @@ export async function buildPack(opts: BuildOptions): Promise<{
 
   // CurseForge ne connait pas les overrides client/serveur : on les replie
   // sur overrides/ plutot que de les perdre en silence.
+  // Un zip serveur se decompresse a la racine du serveur : les fichiers
+  // d'instance y vont directement, sans dossier overrides/.
   const outPath = (p: string) =>
-    format === "mrpack" ? p : p.replace(/^(client|server)-overrides\//, "overrides/");
+    server
+      ? p.replace(/^(client-|server-)?overrides\//, "")
+      : format === "mrpack"
+        ? p
+        : p.replace(/^(client|server)-overrides\//, "overrides/");
+  /** Dossier des contenus embarques : overrides/ pour un lanceur, la racine pour un serveur. */
+  const bundled_ = (folder: string, fileName: string) =>
+    server ? `${folder}/${fileName}` : `overrides/${folder}/${fileName}`;
 
   const byPath = new Map<string, OverrideSide[]>();
   for (const pack of opts.packFiles) {
     for (const [path, data] of Object.entries(pack.files)) {
       const list = byPath.get(path) ?? [];
-      list.push({ packId: pack.packId, label: pack.label, data });
+      list.push({ packId: pack.packId, label: pack.label, data, modified: pack.dates?.[path] });
       byPath.set(path, list);
     }
   }
@@ -277,15 +306,22 @@ export async function buildPack(opts: BuildOptions): Promise<{
   let conflictsResolved = 0;
 
   for (const [path, sides] of byPath) {
-    if (sides.length === 1 || sides.every((s) => bytesEqual(s.data, sides[0].data))) {
-      write(outPath(path), sides[0].data);
-      overridesWritten++;
+    // Reglages video, resource packs, fichiers server-overrides/ : chacun
+    // ne part que dans l'archive qui s'en sert.
+    if (!includedIn(fileSide(path), dist)) continue;
+    const edited = opts.configEdits?.[path];
+    if (edited !== undefined) {
+      if (write(outPath(path), toU8(edited))) overridesWritten++;
+      if (sides.length > 1) conflictsResolved++;
       continue;
     }
-    const decision = opts.decisions[path] ?? sides[0].packId;
+    if (sides.length === 1 || sides.every((s) => bytesEqual(s.data, sides[0].data))) {
+      if (write(outPath(path), sides[0].data)) overridesWritten++;
+      continue;
+    }
+    const decision = opts.decisions[path] ?? orderSides(sides).ordered[0].packId;
     for (const file of applyDecision(path, sides, decision)) {
-      write(outPath(file.path), file.data);
-      overridesWritten++;
+      if (write(outPath(file.path), file.data)) overridesWritten++;
     }
     conflictsResolved++;
   }
@@ -322,10 +358,12 @@ export async function buildPack(opts: BuildOptions): Promise<{
         indexFiles.push({
           path: `${folderFor(r.kind, schematicFolder)}/${v.fileName}`,
           hashes: { sha1: v.hashes.sha1 ?? "", sha512: v.hashes.sha512 ?? "" },
-          env: {
-            client: envValue(r.project?.clientSide),
-            server: envValue(r.project?.serverSide),
-          },
+          env: opts.sides?.[r.key]
+            ? envFor(opts.sides[r.key])
+            : {
+                client: envValue(r.project?.clientSide),
+                server: envValue(r.project?.serverSide),
+              },
           downloads: [v.downloadUrl!],
           fileSize: v.fileSize,
         });
@@ -344,7 +382,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
     // mods dont l'auteur a coupe la distribution par des tiers.
     const manual = opts.manualFiles?.get(r.key);
     if (manual) {
-      write(`overrides/${folderFor(r.kind, schematicFolder)}/${v.fileName}`, manual);
+      write(bundled_(folderFor(r.kind, schematicFolder), v.fileName), manual);
       bundled++;
       fromManual++;
       continue;
@@ -354,7 +392,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
       toBundle.push({
         key: r.key,
         name: r.name,
-        path: `overrides/${folderFor(r.kind, schematicFolder)}/${v.fileName}`,
+        path: bundled_(folderFor(r.kind, schematicFolder), v.fileName),
         url: v.downloadUrl,
         pageUrl: v.pageUrl ?? r.project?.url,
         failure:
@@ -415,16 +453,11 @@ export async function buildPack(opts: BuildOptions): Promise<{
     );
   }
 
-  const safeName =
-    target.name
-      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .replace(/ /g, "-") || "modpack";
+  const fileName = packFileName(target, format);
 
-  let fileName: string;
-
-  if (format === "mrpack") {
+  if (server) {
+    write("LISEZMOI-SERVEUR.txt", toU8(serverReadme(target, loaderVersion)));
+  } else if (format === "mrpack") {
     const dependencies: Record<string, string> = { minecraft: target.minecraft };
     if (loaderVersion) dependencies[MRPACK_LOADER_KEY[target.loader]] = loaderVersion;
 
@@ -443,14 +476,17 @@ export async function buildPack(opts: BuildOptions): Promise<{
         2,
       ),
     ));
-    fileName = `${safeName}-${target.version}.mrpack`;
   } else {
     write("manifest.json", toU8(
       JSON.stringify(
         {
           minecraft: {
             version: target.minecraft,
-            modLoaders: [{ id: `${target.loader}-${loaderVersion}`, primary: true }],
+            // "forge-" sans numero n'est pas un identifiant valide : mieux
+            // vaut une liste vide, que le lanceur signale clairement.
+            modLoaders: loaderVersion
+              ? [{ id: `${target.loader}-${loaderVersion}`, primary: true }]
+              : [],
           },
           manifestType: "minecraftModpack",
           manifestVersion: 1,
@@ -472,7 +508,6 @@ export async function buildPack(opts: BuildOptions): Promise<{
           "automatiques par le lanceur.",
       );
     }
-    fileName = `${safeName}-${target.version}.zip`;
   }
 
   const ram =
@@ -481,7 +516,7 @@ export async function buildPack(opts: BuildOptions): Promise<{
   write(
     "RAPPORT-DE-FUSION.md",
     toU8(
-      buildMarkdownReport(opts.resolutions, target, ram, {
+      buildMarkdownReport(opts.resolutions, target, ram, opts.sides ?? {}, {
         linked,
         bundled,
         failed,
@@ -528,6 +563,50 @@ export async function buildPack(opts: BuildOptions): Promise<{
   };
 }
 
+/** Nom de fichier sur : le nom et la version du pack sont saisis librement. */
+export function packFileName(
+  target: Pick<MergeTarget, "name" | "version">,
+  format: ExportFormat,
+): string {
+  const safe = (v: string) =>
+    v
+      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/ /g, "-");
+  const version = safe(target.version);
+  const base = `${safe(target.name) || "modpack"}${version ? `-${version}` : ""}`;
+  if (format === "server") return `${base}-serveur.zip`;
+  return `${base}.${format === "mrpack" ? "mrpack" : "zip"}`;
+}
+
+const LOADER_INSTALL: Record<MergeTarget["loader"], string> = {
+  fabric: "https://fabricmc.net/use/server/",
+  quilt: "https://quiltmc.org/en/install/server/",
+  forge: "https://files.minecraftforge.net/",
+  neoforge: "https://neoforged.net/",
+};
+
+/** Mode d'emploi du zip serveur : un serveur n'a pas de lanceur pour le guider. */
+function serverReadme(target: MergeTarget, loaderVersion: string): string {
+  return [
+    `${target.name} ${target.version} — pack serveur`,
+    "",
+    `Minecraft ${target.minecraft}, ${target.loader} ${loaderVersion || "(version a choisir)"}`,
+    "",
+    "1. Installer le serveur " + target.loader + " pour Minecraft " + target.minecraft + " :",
+    `   ${LOADER_INSTALL[target.loader]}`,
+    "2. Decompresser cette archive dans le dossier du serveur, a cote de son .jar.",
+    "   Les dossiers mods/, config/, etc. doivent se retrouver a la racine.",
+    "3. Lancer le serveur une premiere fois, accepter eula.txt, relancer.",
+    "",
+    "Les mods purement client (affichage, interface, shaders) ont ete retires :",
+    "ils empechent souvent un serveur dedie de demarrer. Le detail est dans",
+    "RAPPORT-DE-FUSION.md.",
+    "",
+  ].join("\n");
+}
+
 function envValue(v: string | undefined): string {
   return v === "unsupported" || v === "optional" || v === "required" ? v : "required";
 }
@@ -536,10 +615,15 @@ function buildModlistHtml(kept: ModResolution[], target: MergeTarget): string {
   const rows = kept
     .map(
       (r) =>
-        `<li><a href="${r.project?.url ?? "#"}">${escapeHtml(r.name)}</a> — ${escapeHtml(r.picked?.versionNumber ?? "")}</li>`,
+        `<li><a href="${escapeHtml(safeUrl(r.project?.url))}">${escapeHtml(r.name)}</a> — ${escapeHtml(r.picked?.versionNumber ?? "")}</li>`,
     )
     .join("\n");
   return `<html><head><meta charset="utf-8"><title>${escapeHtml(target.name)}</title></head><body><h1>${escapeHtml(target.name)}</h1><ul>\n${rows}\n</ul></body></html>`;
+}
+
+/** Seuls les liens http(s) sont repris : l'URL vient d'une reponse d'API. */
+function safeUrl(url: string | undefined): string {
+  return url && /^https?:\/\//i.test(url) ? url : "#";
 }
 
 function escapeHtml(s: string): string {
@@ -608,6 +692,7 @@ function buildMarkdownReport(
   resolutions: ModResolution[],
   target: MergeTarget,
   ram: RamEstimate,
+  sides: Record<string, Side>,
   stats: {
     linked: number;
     bundled: number;
@@ -633,7 +718,7 @@ function buildMarkdownReport(
     `- Mods lies : ${stats.linked} · mods embarques : ${stats.bundled}`,
     `- Conflits de configuration arbitres : ${stats.conflictsResolved}`,
     "",
-    ...contentSections(buildSummary(resolutions)),
+    ...contentSections(buildSummary(resolutions, sides)),
     "## Memoire recommandee",
     "",
     `- **Client : ${ram.clientGb} Go** (minimum fonctionnel : ${ram.minimumGb} Go)`,

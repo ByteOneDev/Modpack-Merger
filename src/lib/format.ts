@@ -26,3 +26,10 @@ export function packLabel(index: number): string {
 export function plural(n: number, singular: string, pluralForm?: string): string {
   return `${n} ${n > 1 ? (pluralForm ?? `${singular}s`) : singular}`;
 }
+
+const DATE_FORMAT = new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short" });
+
+/** « 12 août 2026 à 14:00 » */
+export function formatDate(ms: number): string {
+  return DATE_FORMAT.format(ms);
+}

@@ -17,13 +17,21 @@ import { ExportGate } from "@/components/export-gate";
 import { ManualDownloads } from "@/components/manual-downloads";
 import { useMerge } from "@/lib/store";
 import { readPackFiles } from "@/lib/analyze";
-import { buildPack, IncompletePack, type BuildReport, type ExportFormat } from "@/lib/core/build";
-import { checkReadiness, summarizeBlockers } from "@/lib/readiness";
+import {
+  buildPack, IncompletePack, packFileName, type BuildReport, type ExportFormat,
+} from "@/lib/core/build";
+import { checkReadiness, combineReadiness, summarizeBlockers } from "@/lib/readiness";
+import {
+  distributionsFor, effectiveSide, resolutionsFor, type Distribution, type Side,
+} from "@/lib/core/sides";
 import { excludeMany } from "@/lib/actions";
 import { buildSummary } from "@/lib/core/summary";
 import { countLabel } from "@/lib/core/content";
 import { loadManualFiles, pendingDownloads } from "@/lib/manual";
-import { askWhereToSave, canStreamToDisk, downloadBlob } from "@/lib/save";
+import {
+  askWhereToSave, askWhereToSaveMany, canPickDirectory, canStreamToDisk, downloadBlob,
+} from "@/lib/save";
+import type { ZipSink } from "@/lib/core/zip";
 import { humanSize } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -31,10 +39,15 @@ export default function ExportPage() {
   const router = useRouter();
   const { state, setState, settings, hydrated } = useMerge();
 
-  const [format, setFormat] = React.useState<ExportFormat>(settings.defaultExportFormat);
-  const [bundleJars, setBundleJars] = React.useState(settings.defaultBundleJars);
+  // null tant que l'utilisateur n'a rien choisi : les reglages sont relus
+  // apres le premier rendu, un etat initialise d'emblee ignorait donc les
+  // valeurs par defaut choisies dans les reglages.
+  const [formatChoisi, setFormat] = React.useState<ExportFormat | null>(null);
+  const [bundleChoisi, setBundleJars] = React.useState<boolean | null>(null);
+  const format = formatChoisi ?? settings.defaultExportFormat;
+  const bundleJars = bundleChoisi ?? settings.defaultBundleJars;
   const [progress, setProgress] = React.useState<{ step: string; done: number; total: number } | null>(null);
-  const [report, setReport] = React.useState<BuildReport | null>(null);
+  const [reports, setReports] = React.useState<BuildReport[]>([]);
   const [error, setError] = React.useState<string | null>(null);
   const [showSummary, setShowSummary] = React.useState(false);
   const [savedTo, setSavedTo] = React.useState<string | null>(null);
@@ -55,8 +68,29 @@ export default function ExportPage() {
   const kept = state.resolutions.filter(
     (r) => r.status === "ok" || r.status === "substituted",
   );
-  const summary = buildSummary(state.resolutions);
-  const readiness = checkReadiness(state, { format, bundleJars });
+
+  // Une archive par destination : le pack du lanceur, le zip du serveur, ou
+  // les deux. Le zip serveur embarque toujours ses jars : aucun lanceur ne
+  // les telechargerait pour lui.
+  const packTarget = state.packTarget ?? "both";
+  const sides: Record<string, Side> = {};
+  for (const r of state.resolutions) sides[r.key] = effectiveSide(r, state.sideOverrides ?? {});
+  const jobs = distributionsFor(packTarget).map((dist: Distribution) => ({
+    dist,
+    format: (dist === "server" ? "server" : format) as ExportFormat,
+    bundleJars: dist === "server" ? true : bundleJars,
+    resolutions: resolutionsFor(state.resolutions, state.sideOverrides ?? {}, dist),
+  }));
+  const readiness = combineReadiness(
+    jobs.map((j) =>
+      checkReadiness(
+        { ...state, resolutions: j.resolutions },
+        { format: j.format, bundleJars: j.bundleJars },
+      ),
+    ),
+  );
+  const clientJob = jobs.find((j) => j.dist === "client");
+  const summary = buildSummary(state.resolutions, sides);
   const pending = pendingDownloads(
     state.resolutions,
     state.manualFiles,
@@ -65,45 +99,72 @@ export default function ExportPage() {
 
   async function run() {
     setError(null);
-    setReport(null);
+    setReports([]);
     setProgress({ step: "Preparation", done: 0, total: 1 });
     try {
+      // Le choix du fichier passe avant toute lecture : le navigateur n'ouvre
+      // la fenetre que dans la foulee du clic. Relire d'abord des archives de
+      // plusieurs centaines de Mo depassait ce delai, la fenetre etait
+      // refusee et l'export retombait en silence sur un Blob en memoire.
+      // Pour deux archives, un dossier choisi une fois sert aux deux.
+      const names = jobs.map((j) => packFileName(target, j.format));
+      let sinks: (ZipSink | undefined)[] = jobs.map(() => undefined);
+      let savedName: string | null = null;
+      if (jobs.some((j) => j.bundleJars)) {
+        if (jobs.length > 1 && canPickDirectory()) {
+          const dir = await askWhereToSaveMany(names);
+          if (dir === "cancelled") return;
+          if (dir) {
+            sinks = dir.sinks;
+            savedName = dir.name;
+          }
+        } else if (jobs.length === 1 && canStreamToDisk()) {
+          const file = await askWhereToSave(names[0]);
+          if (file === "cancelled") return;
+          if (file) {
+            sinks = [file.sink];
+            savedName = file.name;
+          }
+        }
+      }
+
       const packFiles = await readPackFiles(state.packs);
       const manualFiles = await loadManualFiles(Object.keys(state.manualFiles));
 
-      // Nom propose avant generation : le choix du fichier doit suivre le
-      // clic de l'utilisateur, sinon le navigateur refuse d'ouvrir la fenetre.
-      const suggested = suggestedFileName(target, format);
-      const destination = bundleJars && canStreamToDisk() ? await askWhereToSave(suggested) : null;
-
-      const built = await buildPack({
-        target,
-        resolutions: state.resolutions,
-        packFiles,
-        decisions: state.decisions,
-        format,
-        bundleJars,
-        concurrency: settings.downloadConcurrency,
-        ram: state.ram ?? undefined,
-        manualFiles,
-        sink: destination?.sink,
-        // Le verrou ci-dessus couvre ce qui est connu d'avance ; ceci couvre
-        // les coupures survenues pendant le telechargement.
-        requireComplete: true,
-        onProgress: (step, done, total) => setProgress({ step, done, total }),
-      });
-
-      // Sans destination disque, l'archive revient en Blob : le navigateur la
-      // garde hors du tas JavaScript, ce qui permet deja de depasser le Go.
-      if (built.blob) downloadBlob(built.blob, built.report.fileName);
-      setSavedTo(destination ? destination.name : null);
-
-      setReport(built.report);
+      const done: BuildReport[] = [];
+      for (const [i, job] of jobs.entries()) {
+        const prefix =
+          jobs.length > 1 ? (job.dist === "server" ? "Pack serveur — " : "Pack client — ") : "";
+        const built = await buildPack({
+          target,
+          resolutions: job.resolutions,
+          packFiles,
+          decisions: state.decisions,
+          format: job.format,
+          bundleJars: job.bundleJars,
+          concurrency: settings.downloadConcurrency,
+          ram: state.ram ?? undefined,
+          manualFiles,
+          sink: sinks[i],
+          sides,
+          configEdits: state.configEdits,
+          // Le verrou ci-dessus couvre ce qui est connu d'avance ; ceci couvre
+          // les coupures survenues pendant le telechargement.
+          requireComplete: true,
+          onProgress: (step, d, total) => setProgress({ step: prefix + step, done: d, total }),
+        });
+        // Sans destination disque, l'archive revient en Blob : le navigateur
+        // la garde hors du tas JavaScript, ce qui permet deja de depasser le Go.
+        if (built.blob) downloadBlob(built.blob, built.report.fileName);
+        done.push(built.report);
+      }
+      setSavedTo(savedName);
+      setReports(done);
       // Les echecs alimentent la liste des telechargements manuels : un CDN
       // qui refuse la requete pose le meme probleme qu'un refus de l'auteur.
       setState((prev) => ({
         ...prev,
-        failedDownloads: built.report.modsFailed.map((f) => f.key),
+        failedDownloads: [...new Set(done.flatMap((r) => r.modsFailed.map((f) => f.key)))],
       }));
     } catch (err) {
       setSavedTo(null);
@@ -177,78 +238,85 @@ export default function ExportPage() {
       <ExportGate
         readiness={readiness}
         onGoToMods={() => router.push("/mods/")}
+        onGoToConflicts={() => router.push("/conflits/")}
         onExclude={(keys) =>
           setState((prev) => ({ ...prev, ...excludeMany(prev, keys, settings) }))
         }
       />
 
-      <Card className="mb-6">
-        <CardHeader>
-          <CardTitle>Format</CardTitle>
-          <CardDescription>Selon le lanceur que tu utilises.</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-2">
-          <Choice
-            selected={format === "mrpack"}
-            onClick={() => setFormat("mrpack")}
-            title=".mrpack"
-            subtitle="Modrinth App, Prism, ATLauncher, MultiMC"
-          />
-          <Choice
-            selected={format === "curseforge"}
-            onClick={() => setFormat("curseforge")}
-            title=".zip CurseForge"
-            subtitle="CurseForge App, hebergeurs de serveurs"
-          />
-        </CardContent>
-      </Card>
+      <DestinationsCard target={packTarget} onChange={() => router.push("/cote/")} />
 
-      <Card className="mb-6">
-        <CardHeader>
-          <CardTitle>Contenu de l&apos;archive</CardTitle>
-        </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-2">
-          <Choice
-            selected={bundleJars}
-            onClick={() => setBundleJars(true)}
-            title="Pack complet"
-            subtitle="les .jar sont telecharges et inclus — s'installe partout, archive lourde"
-            icon={<Package className="size-4" />}
-          />
-          <Choice
-            selected={!bundleJars}
-            onClick={() => setBundleJars(false)}
-            title="Manifeste seul"
-            subtitle="quelques Ko, le lanceur telecharge les mods lui-meme"
-            icon={<FileDown className="size-4" />}
-          />
-        </CardContent>
-      </Card>
+      {clientJob && (
+        <>
+          <Card className="mb-6">
+            <CardHeader>
+              <CardTitle>Format</CardTitle>
+              <CardDescription>Selon le lanceur que tu utilises.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-3 sm:grid-cols-2">
+              <Choice
+                selected={format === "mrpack"}
+                onClick={() => setFormat("mrpack")}
+                title=".mrpack"
+                subtitle="Modrinth App, Prism, ATLauncher, MultiMC"
+              />
+              <Choice
+                selected={format === "curseforge"}
+                onClick={() => setFormat("curseforge")}
+                title=".zip CurseForge"
+                subtitle="CurseForge App, hebergeurs de serveurs"
+              />
+            </CardContent>
+          </Card>
 
-      {!bundleJars && format === "mrpack" && (
-        <Alert variant="info" className="mb-6">
-          <TriangleAlert />
-          <AlertTitle>Les mods hors Modrinth seront quand meme embarques</AlertTitle>
-          <AlertDescription>
-            Un index <code className="font-mono text-xs">.mrpack</code> n&apos;accepte que des
-            liens Modrinth, GitHub ou GitLab. Les autres iront dans{" "}
-            <code className="font-mono text-xs">overrides/mods/</code>.
-          </AlertDescription>
-        </Alert>
-      )}
+          <Card className="mb-6">
+            <CardHeader>
+              <CardTitle>Contenu de l&apos;archive</CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-3 sm:grid-cols-2">
+              <Choice
+                selected={bundleJars}
+                onClick={() => setBundleJars(true)}
+                title="Pack complet"
+                subtitle="les .jar sont telecharges et inclus — s'installe partout, archive lourde"
+                icon={<Package className="size-4" />}
+              />
+              <Choice
+                selected={!bundleJars}
+                onClick={() => setBundleJars(false)}
+                title="Manifeste seul"
+                subtitle="quelques Ko, le lanceur telecharge les mods lui-meme"
+                icon={<FileDown className="size-4" />}
+              />
+            </CardContent>
+          </Card>
 
-      {bundleJars && (
-        <Alert variant="info" className="mb-6">
-          <TriangleAlert />
-          <AlertTitle>Le telechargement se fait depuis ton navigateur</AlertTitle>
-          <AlertDescription>
-            Certains CDN refusent les requetes venant d&apos;une page web. Les mods concernes
-            seront listes dans « Telechargements manuels », a recuperer depuis leur page.{" "}
-            {canStreamToDisk()
-              ? "L'archive sera ecrite au fil de l'eau dans le fichier que tu choisiras : aucune limite de taille."
-              : "Ton navigateur ne permet pas d'ecrire directement sur le disque ; l'archive est assemblee puis telechargee, ce qui peut echouer au-dela de 2 Go. Chrome, Edge et Opera n'ont pas cette limite."}
-          </AlertDescription>
-        </Alert>
+          {!bundleJars && format === "mrpack" && (
+            <Alert variant="info" className="mb-6">
+              <TriangleAlert />
+              <AlertTitle>Les mods hors Modrinth seront quand meme embarques</AlertTitle>
+              <AlertDescription>
+                Un index <code className="font-mono text-xs">.mrpack</code> n&apos;accepte que des
+                liens Modrinth, GitHub ou GitLab. Les autres iront dans{" "}
+                <code className="font-mono text-xs">overrides/mods/</code>.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {bundleJars && (
+            <Alert variant="info" className="mb-6">
+              <TriangleAlert />
+              <AlertTitle>Le telechargement se fait depuis ton navigateur</AlertTitle>
+              <AlertDescription>
+                Certains CDN refusent les requetes venant d&apos;une page web. Les mods concernes
+                seront listes dans « Telechargements manuels », a recuperer depuis leur page.{" "}
+                {canStreamToDisk()
+                  ? "L'archive sera ecrite au fil de l'eau dans le fichier que tu choisiras : aucune limite de taille."
+                  : "Ton navigateur ne permet pas d'ecrire directement sur le disque ; l'archive est assemblee puis telechargee, ce qui peut echouer au-dela de 2 Go. Chrome, Edge et Opera n'ont pas cette limite."}
+              </AlertDescription>
+            </Alert>
+          )}
+        </>
       )}
 
       {readiness.warnings.map((w, i) => (
@@ -291,18 +359,18 @@ export default function ExportPage() {
               Bloque : {summarizeBlockers(readiness)}.
             </span>
           )}
-          <Button variant="outline" onClick={() => router.push("/fichiers/")}>
+          <Button variant="outline" onClick={() => router.push("/cote/")}>
             Retour
           </Button>
         </div>
       )}
 
-      {report && (
-        <Card>
+      {reports.map((report) => (
+        <Card key={report.fileName} className="mb-6">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <CircleCheck className="text-success size-4" />
-              Pack genere
+              {report.fileName.endsWith("-serveur.zip") ? "Pack serveur genere" : "Pack genere"}
             </CardTitle>
             <CardDescription>
               {savedTo
@@ -367,23 +435,49 @@ export default function ExportPage() {
             )}
           </CardContent>
         </Card>
-      )}
+      ))}
     </>
   );
 }
 
-/**
- * Nom propose dans la fenetre d'enregistrement. Le builder recalcule le nom
- * definitif ; ici il s'agit seulement de pre-remplir le champ.
- */
-function suggestedFileName(target: { name: string; version: string }, format: ExportFormat) {
-  const safe =
-    target.name
-      .replace(/[^a-zA-Z0-9 _.+-]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .replace(/ /g, "-") || "modpack";
-  return `${safe}-${target.version}.${format === "mrpack" ? "mrpack" : "zip"}`;
+const TARGET_TEXT: Record<"client" | "server" | "both", { title: string; detail: string }> = {
+  client: {
+    title: "Pack client",
+    detail: "Une archive pour le lanceur des joueurs, sans les mods purement serveur.",
+  },
+  server: {
+    title: "Pack serveur",
+    detail:
+      "Un zip à décompresser dans le dossier du serveur : mods et configs inclus, sans les mods purement client.",
+  },
+  both: {
+    title: "Pack client et pack serveur",
+    detail:
+      "Deux archives générées ensemble : celle du lanceur, et un zip prêt à déposer sur le serveur.",
+  },
+};
+
+/** Rappel de ce qui va etre produit, choisi a l'etape precedente. */
+function DestinationsCard({
+  target,
+  onChange,
+}: {
+  target: "client" | "server" | "both";
+  onChange: () => void;
+}) {
+  const t = TARGET_TEXT[target];
+  return (
+    <Alert variant="info" className="mb-6">
+      <Package />
+      <AlertTitle>{t.title}</AlertTitle>
+      <AlertDescription>
+        <p>{t.detail}</p>
+        <Button size="sm" variant="outline" className="mt-2" onClick={onChange}>
+          Changer à l&apos;étape « Client / Serveur »
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
 }
 
 function Choice({

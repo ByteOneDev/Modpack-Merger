@@ -74,7 +74,9 @@ export default function PacksPage() {
       const target = index + delta;
       if (target < 0 || target >= next.length) return prev;
       [next[index], next[target]] = [next[target], next[index]];
-      return { ...prev, packs: relabel(next) };
+      // L'ordre decide des arbitrages de configuration, figes a l'analyse :
+      // la relancer est le seul moyen qu'il soit reellement pris en compte.
+      return { ...prev, packs: relabel(next), analyzed: false };
     });
   }
 

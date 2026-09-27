@@ -16,10 +16,19 @@ export interface JarMeta {
  * le manifeste ne permettent d'identifier le mod (jars edites a la main,
  * mods non publies, builds de dev).
  */
+const METADATA_FILES = new Set([
+  "fabric.mod.json",
+  "quilt.mod.json",
+  "META-INF/neoforge.mods.toml",
+  "META-INF/mods.toml",
+]);
+
 export function readJarMeta(jar: Uint8Array): JarMeta | null {
   let entries;
   try {
-    entries = readZip(jar);
+    // Seuls les descripteurs sont decompresses : un jar de 200 Mo ouvert en
+    // entier pour lire quelques Ko de metadonnees saturait la memoire.
+    entries = readZip(jar, (p) => METADATA_FILES.has(p));
   } catch {
     return null;
   }

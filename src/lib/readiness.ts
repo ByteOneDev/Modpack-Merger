@@ -18,7 +18,7 @@ import type { MergeState } from "@/lib/store";
  * consignee dans le rapport.
  */
 
-export type BlockerKind = "missing" | "manual" | "failed" | "version";
+export type BlockerKind = "missing" | "manual" | "failed" | "version" | "file";
 
 export interface Blocker {
   kind: BlockerKind;
@@ -36,6 +36,8 @@ export interface Readiness {
   manual: Blocker[];
   failed: Blocker[];
   version: Blocker[];
+  /** fichiers de configuration dont la version a garder reste a confirmer */
+  file: Blocker[];
   /** problemes serieux qui n'empechent pas de generer */
   warnings: string[];
 }
@@ -65,7 +67,13 @@ function label(r: ModResolution): string {
 export function checkReadiness(
   state: Pick<
     MergeState,
-    "resolutions" | "conflicts" | "pinnedConflicts" | "manualFiles" | "failedDownloads"
+    | "resolutions"
+    | "conflicts"
+    | "pinnedConflicts"
+    | "manualFiles"
+    | "failedDownloads"
+    | "overrideConflicts"
+    | "decisions"
   >,
   mode: ExportMode,
 ): Readiness {
@@ -112,6 +120,15 @@ export function checkReadiness(
       `${c.dependencyName} que la ${c.installedVersion} retenue`,
   }));
 
+  // Deux versions d'un fichier, aucune n'est reconnue comme la plus recente :
+  // c'est a l'utilisateur de dire laquelle garder.
+  const file: Blocker[] = pendingFileConflicts(state).map((c) => ({
+    kind: "file" as const,
+    key: c.path,
+    name: c.path.replace(/^(client-|server-)?overrides\//, ""),
+    detail: `${c.sides.length} versions differentes, aucune plus recente que les autres`,
+  }));
+
   const warnings: string[] = [];
   const durs = state.conflicts.filter((c) => c.severity === "hard");
   if (durs.length) {
@@ -131,8 +148,24 @@ export function checkReadiness(
     );
   }
 
-  const blockers = [...version, ...missing, ...manual, ...failed];
-  return { ready: blockers.length === 0, blockers, missing, manual, failed, version, warnings };
+  const blockers = [...version, ...file, ...missing, ...manual, ...failed];
+  return {
+    ready: blockers.length === 0,
+    blockers,
+    missing,
+    manual,
+    failed,
+    version,
+    file,
+    warnings,
+  };
+}
+
+/** Conflits de fichiers sans decision : ni suggestion sure, ni choix de l'utilisateur. */
+export function pendingFileConflicts(
+  state: Pick<MergeState, "overrideConflicts" | "decisions">,
+): MergeState["overrideConflicts"] {
+  return state.overrideConflicts.filter((c) => c.auto === false && !(c.path in state.decisions));
 }
 
 /** Ce qui manque, en une phrase, pour un bouton ou un titre. */
@@ -140,6 +173,9 @@ export function summarizeBlockers(r: Readiness): string {
   const bouts: string[] = [];
   if (r.version.length) {
     bouts.push(`${r.version.length} conflit(s) de version`);
+  }
+  if (r.file.length) {
+    bouts.push(`${r.file.length} fichier(s) a departager`);
   }
   if (r.missing.length) {
     bouts.push(`${r.missing.length} sans version compatible`);
@@ -153,4 +189,34 @@ export function summarizeBlockers(r: Readiness): string {
     );
   }
   return bouts.join(", ");
+}
+
+/**
+ * Conditions reunies pour plusieurs archives a la fois (client et serveur) :
+ * un obstacle commun aux deux n'apparait qu'une fois.
+ */
+export function combineReadiness(list: Readiness[]): Readiness {
+  const uniq = (pick: (r: Readiness) => Blocker[]) => {
+    const seen = new Map<string, Blocker>();
+    for (const r of list) {
+      for (const b of pick(r)) seen.set(`${b.kind}:${b.key}`, b);
+    }
+    return [...seen.values()];
+  };
+  const version = uniq((r) => r.version);
+  const file = uniq((r) => r.file);
+  const missing = uniq((r) => r.missing);
+  const manual = uniq((r) => r.manual);
+  const failed = uniq((r) => r.failed);
+  const blockers = [...version, ...file, ...missing, ...manual, ...failed];
+  return {
+    ready: blockers.length === 0,
+    blockers,
+    missing,
+    manual,
+    failed,
+    version,
+    file,
+    warnings: [...new Set(list.flatMap((r) => r.warnings))],
+  };
 }

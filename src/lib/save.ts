@@ -39,11 +39,15 @@ export function canStreamToDisk(): boolean {
 
 /**
  * Demande ou ecrire, puis renvoie de quoi y ecrire en flux.
- * Renvoie null si l'utilisateur annule ou si le navigateur ne sait pas faire.
+ *
+ * Renvoie "cancelled" si l'utilisateur ferme la fenetre : il ne veut pas du
+ * fichier, generer quand meme et le telecharger ailleurs serait un contresens.
+ * Renvoie null si le navigateur ne sait pas faire ou refuse d'ouvrir la
+ * fenetre : l'appelant se replie alors sur un Blob.
  */
 export async function askWhereToSave(
   suggestedName: string,
-): Promise<{ sink: ZipSink; name: string } | null> {
+): Promise<{ sink: ZipSink; name: string } | "cancelled" | null> {
   const w = window as SaveWindow;
   if (!w.showSaveFilePicker) return null;
 
@@ -59,8 +63,8 @@ export async function askWhereToSave(
         },
       ],
     });
-  } catch {
-    return null; // annulation
+  } catch (err) {
+    return err instanceof DOMException && err.name === "AbortError" ? "cancelled" : null;
   }
 
   const writable = await handle.createWritable();
@@ -72,6 +76,48 @@ export async function askWhereToSave(
       abort: () => writable.abort?.() ?? Promise.resolve(),
     },
   };
+}
+
+type DirWindow = Window & {
+  showDirectoryPicker?: (o?: { mode?: "readwrite" }) => Promise<{
+    name: string;
+    getFileHandle: (name: string, o?: { create?: boolean }) => Promise<SaveHandleLike>;
+  }>;
+};
+
+/**
+ * Un dossier ou ecrire plusieurs archives d'un coup.
+ *
+ * Deux fenetres « Enregistrer sous » a la suite ne marchent pas : la seconde
+ * s'ouvrirait apres la generation de la premiere, bien apres le clic, et le
+ * navigateur la refuserait. Un dossier choisi une fois suffit pour les deux.
+ */
+export async function askWhereToSaveMany(
+  names: string[],
+): Promise<{ sinks: ZipSink[]; name: string } | "cancelled" | null> {
+  const w = window as DirWindow;
+  if (!w.showDirectoryPicker) return null;
+  let dir;
+  try {
+    dir = await w.showDirectoryPicker({ mode: "readwrite" });
+  } catch (err) {
+    return err instanceof DOMException && err.name === "AbortError" ? "cancelled" : null;
+  }
+  const sinks: ZipSink[] = [];
+  for (const n of names) {
+    const handle = await dir.getFileHandle(n, { create: true });
+    const writable = await handle.createWritable();
+    sinks.push({
+      write: (chunk) => writable.write(chunk as BufferSource),
+      close: () => writable.close(),
+      abort: () => writable.abort?.() ?? Promise.resolve(),
+    });
+  }
+  return { sinks, name: dir.name };
+}
+
+export function canPickDirectory(): boolean {
+  return typeof window !== "undefined" && "showDirectoryPicker" in window;
 }
 
 /** Telechargement classique, quand l'archive tient dans un Blob. */

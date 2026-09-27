@@ -8,6 +8,7 @@ import {
   detectPinnedConflicts, fetchPinnedVersion, type PinnedConflict,
 } from "@/lib/core/merge/pinned";
 import { estimateRam } from "@/lib/core/merge/ram";
+import { collapseDuplicates } from "@/lib/core/merge/duplicates";
 import {
   LOADER_COMPAT,
   type Alternative,
@@ -41,9 +42,12 @@ function defaultEnv(kind: ContentKind, side: "client" | "server") {
 /** Recalcule ce qui depend de la liste de mods : conflits et memoire. */
 function withDerived(
   state: MergeState,
-  resolutions: ModResolution[],
+  proposed: ModResolution[],
   settings: Settings,
 ): Partial<MergeState> {
+  // Toute modification peut faire entrer un doublon : une dependance, une
+  // substitution, un mod remis dans la liste.
+  const resolutions = collapseDuplicates(proposed);
   return {
     resolutions,
     conflicts: settings.detectFunctionalConflicts
@@ -71,11 +75,21 @@ export function excludeMod(
   settings: Settings,
 ): Partial<MergeState> {
   const resolutions = state.resolutions.map((r) =>
-    r.key === key
-      ? { ...r, status: "excluded" as const, picked: undefined, reason: "Ecarte manuellement." }
-      : r,
+    r.key === key ? exclude(r, "Ecarte manuellement.") : r,
   );
   return withDerived(state, resolutions, settings);
+}
+
+/** Ecarte un element en gardant de quoi le remettre tel qu'il etait. */
+function exclude(r: ModResolution, reason: string): ModResolution {
+  if (r.status === "excluded") return r;
+  return {
+    ...r,
+    status: "excluded",
+    picked: undefined,
+    reason,
+    beforeExclusion: { status: r.status, picked: r.picked, reason: r.reason },
+  };
 }
 
 /**
@@ -93,9 +107,7 @@ export function excludeMany(
 ): Partial<MergeState> {
   const cibles = new Set(keys);
   const resolutions = state.resolutions.map((r) =>
-    cibles.has(r.key)
-      ? { ...r, status: "excluded" as const, picked: undefined, reason: raison }
-      : r,
+    cibles.has(r.key) ? exclude(r, raison) : r,
   );
   return {
     ...withDerived(state, resolutions, settings),
@@ -109,8 +121,18 @@ export function restoreMod(
   key: string,
   settings: Settings,
 ): Partial<MergeState> {
-  const resolutions = state.resolutions.map((r) => {
+  const resolutions = state.resolutions.map((r): ModResolution => {
     if (r.key !== key) return r;
+    const before = r.beforeExclusion;
+    if (before?.picked && (before.status === "ok" || before.status === "substituted")) {
+      return {
+        ...r,
+        status: before.status,
+        picked: before.picked,
+        reason: before.reason,
+        beforeExclusion: undefined,
+      };
+    }
     if (!r.picked) {
       return { ...r, status: "missing" as const, reason: "Remis dans la liste, sans version trouvee." };
     }
@@ -448,6 +470,39 @@ export async function alignPinnedVersion(
   return withDerived(state, resolutions, settings);
 }
 
+/**
+ * Garde cet exemplaire d'un mod present en double, a la place de celui que la
+ * regle « version la plus recente » avait retenu.
+ */
+export function preferDuplicate(
+  state: MergeState,
+  key: string,
+  settings: Settings,
+): Partial<MergeState> {
+  const chosen = state.resolutions.find((r) => r.key === key);
+  const before = chosen?.beforeExclusion;
+  if (!chosen || chosen.status !== "duplicate" || !before?.picked) return {};
+
+  const resolutions = state.resolutions.map((r): ModResolution => {
+    if (r.key === key) {
+      return {
+        ...r,
+        status: before.status,
+        picked: before.picked,
+        reason: before.reason,
+        beforeExclusion: undefined,
+        duplicateOf: undefined,
+        keptByUser: true,
+      };
+    }
+    // Un seul choix explicite par groupe : l'ancien gagnant redevient
+    // candidat ordinaire, et collapseDuplicates l'ecartera.
+    if (r.key === chosen.duplicateOf) return { ...r, keptByUser: undefined };
+    return r;
+  });
+  return withDerived(state, resolutions, settings);
+}
+
 /** Garde un seul mod d'un groupe en conflit et ecarte les autres. */
 export function resolveConflict(
   state: MergeState,
@@ -458,14 +513,7 @@ export function resolveConflict(
   const drop = new Set(memberKeys.filter((k) => k !== keepKey));
   const keeper = state.resolutions.find((r) => r.key === keepKey);
   const resolutions = state.resolutions.map((r) =>
-    drop.has(r.key)
-      ? {
-          ...r,
-          status: "excluded" as const,
-          picked: undefined,
-          reason: `Ecarte au profit de ${keeper?.name ?? "l'autre mod"}.`,
-        }
-      : r,
+    drop.has(r.key) ? exclude(r, `Ecarte au profit de ${keeper?.name ?? "l'autre mod"}.`) : r,
   );
   return withDerived(state, resolutions, settings);
 }

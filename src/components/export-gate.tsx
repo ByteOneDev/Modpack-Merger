@@ -10,16 +10,20 @@ import type { Blocker, Readiness } from "@/lib/readiness";
 
 const TITRE: Record<Blocker["kind"], string> = {
   version: "Versions incompatibles entre elles",
+  file: "Fichiers de configuration à départager",
   missing: "Sans version compatible",
   manual: "À récupérer à la main",
   failed: "Téléchargement échoué",
 };
 
 const AIDE: Record<Blocker["kind"], string> = {
+  file:
+    "Plusieurs packs fournissent ce fichier avec un contenu différent, et rien n'indique quelle " +
+    "version est la plus récente. Choisis-la dans le centre de conflits.",
   version:
     "Un mod exige une version précise d'un autre, et ce n'est pas celle retenue. Le pack " +
     "s'installerait sans rien dire, puis planterait au chargement du monde. Le réglage se fait " +
-    "à l'étape Mods : rétrograder, ou retirer le mod exigeant.",
+    "dans le centre de conflits : rétrograder, ou retirer le mod exigeant.",
   missing:
     "Ces éléments n'existent pas pour la cible choisie. Cherche une alternative à l'étape Mods, " +
     "ou écarte-les si tu peux t'en passer.",
@@ -43,23 +47,27 @@ export function ExportGate({
   readiness,
   onExclude,
   onGoToMods,
+  onGoToConflicts,
 }: {
   readiness: Readiness;
   onExclude: (keys: string[]) => void;
   onGoToMods: () => void;
+  onGoToConflicts: () => void;
 }) {
   const groupes = (
     [
       { kind: "version", items: readiness.version },
+      { kind: "file", items: readiness.file },
       { kind: "missing", items: readiness.missing },
       { kind: "manual", items: readiness.manual },
       { kind: "failed", items: readiness.failed },
     ] as { kind: Blocker["kind"]; items: Blocker[] }[]
   ).filter((g) => g.items.length > 0);
 
-  // Un conflit de version ne se regle pas en ecartant : la cle designe une
-  // paire de mods, pas un element du pack.
-  const ecartables = readiness.blockers.filter((b) => b.kind !== "version").length;
+  // Un conflit de version ou de fichier ne se regle pas en ecartant : la cle
+  // designe une paire de mods ou un chemin, pas un element du pack.
+  const ecartable = (b: Blocker) => b.kind !== "version" && b.kind !== "file";
+  const ecartables = readiness.blockers.filter(ecartable).length;
 
   if (readiness.ready) {
     return (
@@ -84,9 +92,9 @@ export function ExportGate({
         </CardTitle>
         <CardDescription>
           {ecartables === 0
-            ? "Le pack est complet, mais deux mods exigent des versions qui ne vont pas ensemble. " +
-              "Il s'installerait sans broncher et planterait au chargement du monde — l'outil " +
-              "préfère ne rien produire."
+            ? "Le pack est complet, mais des conflits restent à trancher dans le centre de " +
+              "conflits. Générer maintenant produirait un pack qui s'installe sans broncher puis " +
+              "se comporte mal — l'outil préfère ne rien produire."
             : "Il manque de quoi construire le pack en entier. Une archive incomplète s'installe " +
               "sans broncher et ne se trahit qu'au démarrage du jeu — l'outil préfère ne rien " +
               "produire."}
@@ -110,7 +118,7 @@ export function ExportGate({
                     <div className="text-sm font-medium">{b.name}</div>
                     <p className="text-muted-foreground mt-0.5 text-xs text-pretty">{b.detail}</p>
                   </div>
-                  {b.kind !== "version" && (
+                  {ecartable(b) && (
                     <Button
                       variant="ghost"
                       size="icon-sm"
@@ -130,9 +138,9 @@ export function ExportGate({
                 <Search /> Chercher des alternatives
               </Button>
             )}
-            {g.kind === "version" && (
-              <Button variant="outline" size="sm" className="mt-2" onClick={onGoToMods}>
-                <Search /> Régler à l&apos;étape Mods
+            {(g.kind === "version" || g.kind === "file") && (
+              <Button variant="outline" size="sm" className="mt-2" onClick={onGoToConflicts}>
+                <Search /> Ouvrir le centre de conflits
               </Button>
             )}
           </section>
@@ -154,7 +162,7 @@ export function ExportGate({
                 className="mt-2"
                 onClick={() =>
                   onExclude(
-                    readiness.blockers.filter((b) => b.kind !== "version").map((b) => b.key),
+                    readiness.blockers.filter(ecartable).map((b) => b.key),
                   )
                 }
               >
