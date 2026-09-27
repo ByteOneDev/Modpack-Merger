@@ -86,7 +86,7 @@ export default function ConflictsPage() {
         title="Conflits"
         description="Tout ce qui demande un arbitrage avant l'export, du plus grave au plus anodin. Par défaut, la version la plus récente l'emporte."
         action={
-          <Button onClick={() => router.push("/export/")}>
+          <Button onClick={() => router.push("/cote/")}>
             Continuer <ArrowRight />
           </Button>
         }
@@ -231,8 +231,8 @@ export default function ConflictsPage() {
       )}
 
       <div className="flex items-center gap-3">
-        <Button onClick={() => router.push("/export/")}>
-          Continuer vers l&apos;export <ArrowRight />
+        <Button onClick={() => router.push("/cote/")}>
+          Continuer vers « Client / Serveur » <ArrowRight />
         </Button>
         <Button variant="outline" onClick={() => router.push("/mods/")}>
           Retour aux mods

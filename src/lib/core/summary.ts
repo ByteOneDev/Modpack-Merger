@@ -80,7 +80,14 @@ function originOf(r: ModResolution): SummaryItem["origin"] {
   return r.from.kind === "dependency" ? "dependency" : r.from.kind === "manual" ? "manual" : "pack";
 }
 
-export function buildSummary(resolutions: ModResolution[]): PackSummary {
+/**
+ * @param sides cote choisi a la main par cle de resolution ; il l'emporte sur
+ *   ce que declarent les sources.
+ */
+export function buildSummary(
+  resolutions: ModResolution[],
+  sides: Record<string, Side> = {},
+): PackSummary {
   const kept = resolutions.filter(
     (r) => (r.status === "ok" || r.status === "substituted") && r.picked,
   );
@@ -111,7 +118,7 @@ export function buildSummary(resolutions: ModResolution[]): PackSummary {
       key: r.key,
       name: r.name,
       kind: r.kind,
-      side: sideOf(r),
+      side: sides[r.key] ?? sideOf(r),
       versionNumber: v.local ? "" : v.versionNumber,
       // Un fichier depose par l'utilisateur ne vient d'aucune plateforme :
       // afficher "modrinth" serait faux.

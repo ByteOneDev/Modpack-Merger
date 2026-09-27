@@ -60,13 +60,21 @@ export async function readPackFiles(packs: ParsedPack[]): Promise<PackFiles[]> {
   return out;
 }
 
-/** Lance la fusion complete. Tout s'execute dans le navigateur. */
+/**
+ * Lance la fusion complete. Tout s'execute dans le navigateur.
+ *
+ * La cible client/serveur, les cotes choisis et les fichiers edites a la
+ * main ne sont pas recalcules : ce sont des decisions de l'utilisateur, et
+ * elles survivent a une nouvelle analyse.
+ */
 export async function runAnalysis(
   packs: ParsedPack[],
   target: MergeTarget,
   settings: Settings,
   onProgress: (p: AnalyzeProgress) => void,
-): Promise<Omit<MergeState, "packs" | "target">> {
+): Promise<
+  Omit<MergeState, "packs" | "target" | "packTarget" | "sideOverrides" | "configEdits">
+> {
   const labelById = new Map(packs.map((p) => [p.id, p.label]));
 
   // 1. deduplication de tous les mods, tous packs confondus

@@ -17,6 +17,7 @@ import { detectRelay, type RelayStatus } from "@/lib/relay";
 import { dropAllArchives, reparerStockage } from "@/lib/archives";
 import { dropAllManualFiles, type ManualFileInfo } from "@/lib/manual";
 import type { PinnedConflict } from "@/lib/core/merge/pinned";
+import type { PackTarget, Side } from "@/lib/core/sides";
 
 const STATE_KEY = "modpack-merger.state.v1";
 
@@ -39,6 +40,12 @@ export interface MergeState {
   manualFiles: Record<string, ManualFileInfo>;
   /** cles dont le telechargement automatique a echoue au dernier export */
   failedDownloads: string[];
+  /** pack pour les joueurs, pour un serveur dedie, ou les deux */
+  packTarget: PackTarget;
+  /** cote choisi a la main, par cle de resolution ; sinon celui des sources */
+  sideOverrides: Record<string, Side>;
+  /** fichiers modifies dans l'editeur, par chemin de destination */
+  configEdits: Record<string, string>;
 }
 
 const EMPTY: MergeState = {
@@ -54,6 +61,9 @@ const EMPTY: MergeState = {
   analyzed: false,
   manualFiles: {},
   failedDownloads: [],
+  packTarget: "both",
+  sideOverrides: {},
+  configEdits: {},
 };
 
 interface Ctx {
@@ -202,6 +212,7 @@ export const STEPS = [
   { href: "/cible/", label: "Configuration cible", short: "Cible" },
   { href: "/mods/", label: "Mods", short: "Mods" },
   { href: "/conflits/", label: "Conflits", short: "Conflits" },
+  { href: "/cote/", label: "Client / Serveur", short: "Côté" },
   { href: "/export/", label: "Export", short: "Export" },
 ] as const;
 
@@ -209,5 +220,5 @@ export const STEPS = [
 export function furthestStep(state: MergeState): number {
   if (!state.packs.length) return 0;
   if (!state.analyzed) return 1;
-  return 4;
+  return STEPS.length - 1;
 }

@@ -190,3 +190,33 @@ export function summarizeBlockers(r: Readiness): string {
   }
   return bouts.join(", ");
 }
+
+/**
+ * Conditions reunies pour plusieurs archives a la fois (client et serveur) :
+ * un obstacle commun aux deux n'apparait qu'une fois.
+ */
+export function combineReadiness(list: Readiness[]): Readiness {
+  const uniq = (pick: (r: Readiness) => Blocker[]) => {
+    const seen = new Map<string, Blocker>();
+    for (const r of list) {
+      for (const b of pick(r)) seen.set(`${b.kind}:${b.key}`, b);
+    }
+    return [...seen.values()];
+  };
+  const version = uniq((r) => r.version);
+  const file = uniq((r) => r.file);
+  const missing = uniq((r) => r.missing);
+  const manual = uniq((r) => r.manual);
+  const failed = uniq((r) => r.failed);
+  const blockers = [...version, ...file, ...missing, ...manual, ...failed];
+  return {
+    ready: blockers.length === 0,
+    blockers,
+    missing,
+    manual,
+    failed,
+    version,
+    file,
+    warnings: [...new Set(list.flatMap((r) => r.warnings))],
+  };
+}
